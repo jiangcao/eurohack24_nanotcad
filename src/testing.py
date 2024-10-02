@@ -35,6 +35,6 @@ GL = comm.bcast(GL, root=0)
 bse._calc_noninteracting_twobody(GG,GL)
 
 # %%
-bse._calc_kernel(W,V)
+bse._calc_kernel(V,W)
 
 

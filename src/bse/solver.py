@@ -128,20 +128,23 @@ class BSESolver():
             for col in range(self.num_sites):        
                 i=self.table[0,row]
                 k=self.table[0,col]
-                kernel_tip[row,col] = V[i,k]
+                kernel_tip[row,col] += -1j * V[i,k]
                 if (row == col):
-                    kernel_tip[row,col] += 1.0
+                    kernel_tip[row,col] += 1j * W[i,i]
         for row in range(self.num_sites,self.totalsize):
             if (row < self.size):
                 i=self.table[0,row]
                 j=self.table[1,row]
-                kernel_diag[row-self.tipsize] += W[i,j]
-            kernel_diag[row-self.tipsize] += 1.0
+                kernel_diag[row-self.tipsize] += 1j * W[i,j]
+            
         return kernel_tip, kernel_diag
     
 
     def _solve_interacting_twobody(self,V:xp.array,W:xp.array):
-        kernel_tip,kernel_diag = BSESolver._calc_kernel(V,W)
+
+        kernel_tip,kernel_diag = self._calc_kernel(V,W)
+        L0_tip = self.L0mat.blocks[0,0]
+        # build system matrix
 
         return
     
