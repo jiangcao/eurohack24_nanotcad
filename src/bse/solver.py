@@ -10,7 +10,7 @@ class BSESolver():
         self.cutoff=cutoff
         
     @nb.njit(parallel=True, fastmath=True)
-    def _get_sparsity(size:int,cutoff:int,table:xp.ndarray):
+    def _get_sparsity(size:xp.int32,cutoff:xp.int32,table:xp.ndarray):
         nnz = 0
         coords = xp.zeros((size, size), dtype=nb.boolean)
         for row in nb.prange(size):
@@ -36,12 +36,13 @@ class BSESolver():
         self.size = self.num_sites**2 - (self.num_sites - self.cutoff - 1) * (
             self.num_sites - self.cutoff
         )  # compressed system size ~ 2*nm_dev*ndiag-ndiag*ndiag
-        self.table = xp.zeros((2, self.size), dtype=int)
-        self.inverse_table = xp.zeros((self.num_sites, self.num_sites), dtype=int) * xp.nan
+        self.table = xp.zeros((2, self.size), dtype=xp.int32)
+        self.inverse_table = xp.zeros((self.num_sites, self.num_sites), dtype=xp.int32) * xp.nan
         # construct a lookup table of reordered indices tip for the
         # "exchange" space， where we put the i=j.
         for i in range(self.num_sites):
-            self.table[:, i] = [i, i]
+            self.table[0, i] = i
+            self.table[1, i] = i
             self.inverse_table[i, i] = i
 
         # then put the others, but within the ndiag
@@ -52,7 +53,8 @@ class BSESolver():
             for j in range(l, k + 1):
                 if i == j:
                     continue
-                self.table[:, offset] = [i, j]
+                self.table[0, offset] = i 
+                self.table[0, offset] = j
                 self.inverse_table[i, j] = offset
                 offset += 1
 
@@ -86,6 +88,7 @@ class BSESolver():
         ARRAY_SHAPE = (self.totalsize, self.totalsize)
         BLOCK_SIZES = xp.concatenate([[self.tipsize],self.blocksize*xp.ones(self.num_blocks,dtype=int)])
         GLOBAL_STACK_SHAPE = (num_E,)        
+        self.num_E=num_E
         data = xp.zeros(len(self.rows),dtype=xp.complex128)        
         coords = (self.rows,self.cols)                
         coo = sparse.coo_array((data,coords),shape=ARRAY_SHAPE)
@@ -103,6 +106,7 @@ class BSESolver():
         nnz_section_offsets = xp.hstack(([0], xp.cumsum(self.L0mat.nnz_section_sizes)))
         start_inz = nnz_section_offsets[comm.rank]
         end_inz = nnz_section_offsets[comm.rank+1]
+        G_nen = GG.shape[-1]
         
         for inz in range(start_inz,end_inz):
             row=self.L0mat.rows[inz]
@@ -112,9 +116,12 @@ class BSESolver():
             j=self.table[1,row]
             k=self.table[0,col]
             l=self.table[1,col]
+
+            # print(row,col,i,j,k,l)
         
             L_ijkl  = correlate(GG[i,k,:],GL[l,j,:]) - correlate(GL[i,k,:],GG[l,j,:])            
-            self.L0mat[row,col] = L_ijkl            
+            self.L0mat[row,col] = L_ijkl[G_nen:G_nen+self.num_E] 
+
         # transpose to stack distribution
         self.L0mat.dtranspose()
         return
@@ -144,6 +151,7 @@ class BSESolver():
 
         kernel_tip,kernel_diag = self._calc_kernel(V,W)
         L0_tip = self.L0mat.blocks[0,0]
+        
         # build system matrix
 
         return
