@@ -24,3 +24,5 @@ num_E=GG.shape[-1]-1
 bse._alloc_twobody_matrix(num_E=num_E)
 
 bse._calc_noninteracting_twobody(GG,GL)
+
+bse._solve_interacting_twobody()

@@ -54,7 +54,7 @@ class BSESolver():
                 if i == j:
                     continue
                 self.table[0, offset] = i 
-                self.table[0, offset] = j
+                self.table[1, offset] = j
                 self.inverse_table[i, j] = offset
                 offset += 1
 
@@ -148,13 +148,46 @@ class BSESolver():
     
 
     def _solve_interacting_twobody(self,V:xp.array,W:xp.array):
+        if (self.L0mat.distribution_state != 'stack'):
+            self.L0mat.dtranspose()
 
         kernel_tip,kernel_diag = self._calc_kernel(V,W)
-        L0_tip = self.L0mat.blocks[0,0]
-        
-        # build system matrix
 
-        return
+        A_upperarrow = xp.zeros((self.tipsize,self.blocksize,self.num_blocks),dtype=xp.complex128)
+        A_lowerarrow = xp.zeros((self.blocksize,self.tipsize,self.num_blocks),dtype=xp.complex128)
+        A_diag= xp.zeros((self.blocksize,self.blocksize,self.num_blocks),dtype=xp.complex128)
+        A_upper= xp.zeros((self.blocksize,self.blocksize,self.num_blocks-1),dtype=xp.complex128)
+        A_lower= xp.zeros((self.blocksize,self.blocksize,self.num_blocks-1),dtype=xp.complex128)
+
+        P= xp.zeros((self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+        
+        for ie in range(self.L0mat.stack_shape[0]):
+            # build system matrix: A = I - L0 @ K
+
+            A_tip = - self.L0mat.stack[ie].blocks[0,0] @ kernel_tip + xp.eye(self.tipsize)
+            
+            for k in range(self.num_blocks):
+                A_diag[:,:,k] = - self.L0mat.stack[ie].blocks[k+1,k+1] @ xp.diag( kernel_diag[self.blocksize*k:self.blocksize*(k+1)] ) + xp.eye(self.blocksize)
+
+            for k in range(self.num_blocks-1):
+                A_upper[:,:,k] = - self.L0mat.stack[ie].blocks[k+1,k+2] @ xp.diag( kernel_diag[self.blocksize*(k+1):self.blocksize*(k+2)] )
+                A_lower[:,:,k] = - self.L0mat.stack[ie].blocks[k+2,k+1] @ xp.diag( kernel_diag[self.blocksize*(k):self.blocksize*(k+1)] )                
+
+            for k in range(self.num_blocks):
+                A_lowerarrow[:,:,k] = - self.L0mat.stack[ie].blocks[k+1,0] @ kernel_tip
+                A_upperarrow[:,:,k] = - self.L0mat.stack[ie].blocks[0,k+1] @ xp.diag( kernel_diag[self.blocksize*k:self.blocksize*(k+1)] )
+
+            # need to flip the BTA matrix before calling solver ?
+
+            # solve system matrix in-place
+
+            # need to flip back the BTA matrix ?
+
+            # extract P from tip of solution matrix L = A^{-1} @ L0      
+            P[:,:,ie] = - 1j * A_tip @ self.L0mat.stack[ie].blocks[0,0] 
+            for k in range(self.num_blocks):
+                P[:,:,ie] += A_upperarrow[:,:,k] @ self.L0mat.stack[ie].blocks[k+1,0]
+        return P
     
 
 def fftconvolve(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
