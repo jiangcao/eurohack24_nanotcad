@@ -3,6 +3,7 @@ from qttools.datastructures import DSBCOO,DSBSparse
 import numba as nb 
 from scipy import sparse
 from qttools.utils.gpu_utils import xp
+import numpy as np
 
 class BSESolver():
     def __init__(self,num_sites:int,cutoff:int) -> None:
@@ -10,9 +11,9 @@ class BSESolver():
         self.cutoff=cutoff
         
     @nb.njit(parallel=True, fastmath=True)
-    def _get_sparsity(size:xp.int32,cutoff:xp.int32,table:xp.ndarray):
+    def _get_sparsity(size:np.int32,cutoff:np.int32,table:np.ndarray):
         nnz = 0
-        coords = xp.zeros((size, size), dtype=nb.boolean)
+        coords = np.zeros((size, size), dtype=nb.boolean)
         for row in nb.prange(size):
             for col in nb.prange(size):
                 i, j = table[:, row]
@@ -62,14 +63,15 @@ class BSESolver():
             print(f"ERROR!, it={offset}, N={self.size}")
 
         # determine number of nnz and sparsity pattern
-        self.nnz, coords = BSESolver._get_sparsity(self.size,self.cutoff,self.table)
+        table=self.table.get()
+        self.nnz, coords = BSESolver._get_sparsity(self.size,self.cutoff,table)
         self.rows, self.cols = coords.nonzero()
 
         arrow_mask = (self.rows > self.num_sites) & (self.cols > self.num_sites)
-        bandwidth = xp.max(self.cols[arrow_mask] - self.rows[arrow_mask]) + 1
+        bandwidth = np.max(self.cols[arrow_mask] - self.rows[arrow_mask]) + 1
 
         self.blocksize = bandwidth  # <= 2*cutoff*(cutoff)
-        self.num_blocks = int(xp.ceil((self.size - self.num_sites) / self.blocksize))
+        self.num_blocks = int(np.ceil((self.size - self.num_sites) / self.blocksize))
         self.arrowsize = int(self.blocksize) * int(self.num_blocks)
         self.tipsize = self.num_sites
         self.totalsize = self.arrowsize + self.tipsize
@@ -86,10 +88,10 @@ class BSESolver():
 
     def _alloc_twobody_matrix(self,num_E:int):
         ARRAY_SHAPE = (self.totalsize, self.totalsize)
-        BLOCK_SIZES = xp.concatenate([[self.tipsize],self.blocksize*xp.ones(self.num_blocks,dtype=int)])
+        BLOCK_SIZES = np.concatenate([[self.tipsize],self.blocksize*np.ones(self.num_blocks,dtype=int)])
         GLOBAL_STACK_SHAPE = (num_E,)        
         self.num_E=num_E
-        data = xp.zeros(len(self.rows),dtype=xp.complex128)        
+        data = np.zeros(len(self.rows),dtype=xp.complex128)        
         coords = (self.rows,self.cols)                
         coo = sparse.coo_array((data,coords),shape=ARRAY_SHAPE)
         self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)        
@@ -103,9 +105,9 @@ class BSESolver():
     def _calc_noninteracting_twobody(self,GG:xp.array,GL:xp.array):
         if (self.L0mat.distribution_state == 'stack'):
             self.L0mat.dtranspose()
-        nnz_section_offsets = xp.hstack(([0], xp.cumsum(self.L0mat.nnz_section_sizes)))
-        start_inz = nnz_section_offsets[comm.rank]
-        end_inz = nnz_section_offsets[comm.rank+1]
+        nnz_section_offsets = np.hstack(([0], np.cumsum(self.L0mat.nnz_section_sizes)))
+        start_inz = int(nnz_section_offsets[comm.rank])
+        end_inz = int(nnz_section_offsets[comm.rank+1])
         G_nen = GG.shape[-1]
         
         for inz in range(start_inz,end_inz):
@@ -117,7 +119,7 @@ class BSESolver():
             k=self.table[0,col]
             l=self.table[1,col]
 
-            # print(row,col,i,j,k,l)
+            print(row,col,i,j,k,l)
         
             L_ijkl  = correlate(GG[i,k,:],GL[l,j,:]) - correlate(GL[i,k,:],GG[l,j,:])            
             self.L0mat[row,col] = L_ijkl[G_nen:G_nen+self.num_E] 
