@@ -25,4 +25,4 @@ bse._alloc_twobody_matrix(num_E=num_E)
 
 bse._calc_noninteracting_twobody(GG,GL)
 
-P = bse._solve_interacting_twobody(V,W)
+P, Gamma = bse._solve_interacting_twobody(V,W)

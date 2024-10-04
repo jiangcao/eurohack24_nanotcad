@@ -160,6 +160,7 @@ class BSESolver():
         A_lower= xp.zeros((self.blocksize,self.blocksize,self.num_blocks-1),dtype=xp.complex128)
 
         P= xp.zeros((self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+        Gamma= xp.zeros((self.tipsize,self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
         
         for ie in range(self.L0mat.stack_shape[0]):
             # build system matrix: A = I - L0 @ K
@@ -179,15 +180,43 @@ class BSESolver():
 
             # need to flip the BTA matrix before calling solver ?
 
-            # solve system matrix in-place
+            # solve system matrix in-place, call SerinV
 
             # need to flip back the BTA matrix ?
 
-            # extract P from tip of solution matrix L = A^{-1} @ L0      
-            P[:,:,ie] = - 1j * A_tip @ self.L0mat.stack[ie].blocks[0,0] 
+            # extract P from tip of solution matrix L =  A^{-1} @ L0, and P := -i L_tip      
+            tmp = xp.zeros((self.tipsize,self.tipsize), dtype=xp.complex128)            
+            tmp = - 1j * A_tip @ self.L0mat.stack[ie].blocks[0,0] 
             for k in range(self.num_blocks):
-                P[:,:,ie] += A_upperarrow[:,:,k] @ self.L0mat.stack[ie].blocks[k+1,0]
-        return P
+                tmp += - 1j * A_upperarrow[:,:,k] @ self.L0mat.stack[ie].blocks[k+1,0]
+            for row in range(self.tipsize):
+                for col in range(self.tipsize):
+                    i=self.table[0,row]
+                    j=self.table[0,col]
+                    P[i,j,ie] = tmp[row,col]
+            # extract Gamma from upper-arrow block of L = A^{-1} @ L0, and Gamma_ijk := L_iijk
+            # L_01 = A_00 @ L0_01 + A_01 @ L0_11
+            tmp2 = xp.zeros((self.tipsize,self.blocksize,self.num_blocks), dtype=xp.complex128)            
+            for k in range(self.num_blocks):
+                tmp2[:,:,k] += A_tip @ self.L0mat.stack[ie].blocks[0,k+1]
+                tmp2[:,:,k] += A_upperarrow[:,:,k] @ self.L0mat.stack[ie].blocks[k+1,k+1]    
+                if k > 0:
+                    tmp2[:,:,k] += A_upperarrow[:,:,k-1] @ self.L0mat.stack[ie].blocks[k-1,k]
+                if k < self.num_blocks-1:
+                    tmp2[:,:,k] += A_upperarrow[:,:,k+1] @ self.L0mat.stack[ie].blocks[k+1,k]
+            
+            for row in range(self.tipsize):
+                i = self.table(0, row)
+                for ib in range(self.num_blocks):
+                    for ic in range(self.blocksize):
+                        col = ib*self.blocksize + ic + self.tipsize
+
+                        if col < self.size:
+                            j = self.table(0,col)
+                            k = self.table(1,col)
+
+                            Gamma[i,j,k,ie] = tmp2[row, ic, ib]
+        return P, Gamma
     
 
 def fftconvolve(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
