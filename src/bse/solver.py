@@ -201,19 +201,19 @@ class BSESolver():
                 tmp2[:,:,k] += A_tip @ self.L0mat.stack[ie].blocks[0,k+1]
                 tmp2[:,:,k] += A_upperarrow[:,:,k] @ self.L0mat.stack[ie].blocks[k+1,k+1]    
                 if k > 0:
-                    tmp2[:,:,k] += A_upperarrow[:,:,k-1] @ self.L0mat.stack[ie].blocks[k-1,k]
+                    tmp2[:,:,k] += A_upperarrow[:,:,k-1] @ self.L0mat.stack[ie].blocks[k,k+1]
                 if k < self.num_blocks-1:
-                    tmp2[:,:,k] += A_upperarrow[:,:,k+1] @ self.L0mat.stack[ie].blocks[k+1,k]
+                    tmp2[:,:,k] += A_upperarrow[:,:,k+1] @ self.L0mat.stack[ie].blocks[k+2,k+1]
             
             for row in range(self.tipsize):
-                i = self.table(0, row)
+                i = self.table[0, row]
                 for ib in range(self.num_blocks):
                     for ic in range(self.blocksize):
                         col = ib*self.blocksize + ic + self.tipsize
 
                         if col < self.size:
-                            j = self.table(0,col)
-                            k = self.table(1,col)
+                            j = self.table[0,col]
+                            k = self.table[1,col]
 
                             Gamma[i,j,k,ie] = tmp2[row, ic, ib]
         return P, Gamma
