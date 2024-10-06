@@ -18,7 +18,7 @@ W=xp.array( indata['W0_r'] ,dtype=xp.complex128)
 nm_dev = int(indata['nm_dev'])
 ndiag = int(indata['ndiag'])
 
-ndiag=10
+ndiag=2
 bse=BSESolver(nm_dev,ndiag)
 bse._preprocess()
 

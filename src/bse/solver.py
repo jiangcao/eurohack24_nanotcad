@@ -4,7 +4,7 @@ import numba as nb
 from scipy import sparse
 from qttools.utils.gpu_utils import xp, get_host
 import numpy as np
-from cupyx import scipy as cux
+from cupyx.scipy import sparse as cusparse
 
 class BSESolver():
     def __init__(self,num_sites:int,cutoff:int) -> None:
@@ -135,7 +135,7 @@ class BSESolver():
         kernel_diag=xp.zeros((self.totalsize-self.tipsize), dtype=xp.complex128)
 
         kernel_tip = - V[self.table[0,:self.num_sites], self.table[0,:self.num_sites]] + xp.diag(xp.array([W[self.table[0,i],self.table[0,i]] for i in range(self.num_sites)]))
-        
+
         # for row in range(self.num_sites):
         #     for col in range(self.num_sites):        
         #         i=self.table[0,row]
@@ -158,24 +158,25 @@ class BSESolver():
             self.L0mat.dtranspose()    
         kernel_tip,kernel_diag = self._calc_kernel(V,W)
 
-        K = np.zeros((self.size,self.size),dtype=xp.complex128)    
-        P= np.zeros((self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
-        Gamma= np.zeros((self.tipsize,self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+        K = xp.zeros((self.size,self.size),dtype=xp.complex128)    
+        P= xp.zeros((self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+        Gamma= xp.zeros((self.tipsize,self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
 
-        K[:self.tipsize,:self.tipsize] = get_host(kernel_tip)
-        K[self.tipsize:,self.tipsize:] = np.diag(get_host(kernel_diag)[:self.size-self.tipsize])
+        K[:self.tipsize,:self.tipsize] = kernel_tip
+        K[self.tipsize:,self.tipsize:] = np.diag(kernel_diag[:self.size-self.tipsize])
+        
+        table=self.table
+        local_nen = self.L0mat.stack_shape[0]
 
-        table= get_host(self.table)
-
-        for ie in range(self.L0mat.stack_shape[0]):
-            print('ie=',ie,flush=True)
+        for ie in range(local_nen):
+            print('rank=',comm.rank,'ie=',ie+1,'/',local_nen,flush=True)
             data = self.L0mat.data[ie]
-            coords = (get_host(self.L0mat.rows), get_host(self.L0mat.cols))            
-            L0 = sparse.coo_matrix((get_host(data),coords),
+            coords = (self.L0mat.rows, self.L0mat.cols)            
+            L0 = cusparse.coo_matrix((data,coords),
                                    shape= (self.size, self.size)).todense()
-            k=get_host(K)
-            A = - L0 @ k + np.diag(np.ones(self.size, dtype=np.complex128))
-            A = np.linalg.inv(A) @ L0
+
+            A = - L0 @ K + xp.diag(xp.ones(self.size, dtype=xp.complex128))
+            A = xp.linalg.inv(A) @ L0
             
             for row in range(self.tipsize):
                 for col in range(self.tipsize):
