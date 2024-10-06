@@ -4,6 +4,7 @@ import numba as nb
 from scipy import sparse
 from qttools.utils.gpu_utils import xp
 import numpy as np
+from cupyx import scipy as cux
 
 class BSESolver():
     def __init__(self,num_sites:int,cutoff:int) -> None:
@@ -119,7 +120,7 @@ class BSESolver():
             k=self.table[0,col]
             l=self.table[1,col]
 
-            print(row,col,i,j,k,l)
+            # print(row,col,i,j,k,l)
         
             L_ijkl  = correlate(GG[i,k,:],GL[l,j,:]) - correlate(GL[i,k,:],GG[l,j,:])            
             self.L0mat[row,col] = L_ijkl[G_nen:G_nen+self.num_E] 
@@ -130,24 +131,58 @@ class BSESolver():
     
     def _calc_kernel(self,V:xp.array,W:xp.array):
         
-        kernel_tip=xp.zeros((self.tipsize,self.tipsize),dtype=xp.complex128)
-        kernel_diag=xp.zeros((self.totalsize-self.tipsize),dtype=xp.complex128)
-
-        for row in range(self.num_sites):
-            for col in range(self.num_sites):        
-                i=self.table[0,row]
-                k=self.table[0,col]
-                kernel_tip[row,col] += -1j * V[i,k]
-                if (row == col):
-                    kernel_tip[row,col] += 1j * W[i,i]
+        kernel_tip=xp.zeros((self.tipsize,self.tipsize), dtype=xp.complex128)
+        kernel_diag=xp.zeros((self.totalsize-self.tipsize), dtype=xp.complex128)
+        kernel_tip = - V[self.table[0,:self.num_sites], self.table[0,:self.num_sites]] + xp.diag(xp.array([W[self.table[0,i],self.table[0,i]] for i in range(self.num_sites)]))
+        # for row in range(self.num_sites):
+        #     for col in range(self.num_sites):        
+        #         i=self.table[0,row]
+        #         k=self.table[0,col]                         
+        #         print(V[i,k])       
+        #         kernel_tip[row,col] += - V[i,k]
+        #         if (row == col):
+        #             kernel_tip[row,col] += W[i,i]
         for row in range(self.num_sites,self.totalsize):
             if (row < self.size):
                 i=self.table[0,row]
                 j=self.table[1,row]
-                kernel_diag[row-self.tipsize] += 1j * W[i,j]
-            
+                kernel_diag[row-self.tipsize] += W[i,j]
+        kernel_diag *=  1j
+        kernel_tip *= 1j
         return kernel_tip, kernel_diag
-    
+
+    def _densesolve_interacting_twobody(self,V:xp.array,W:xp.array):
+        if (self.L0mat.distribution_state != 'stack'):
+            self.L0mat.dtranspose()    
+        kernel_tip,kernel_diag = self._calc_kernel(V,W)
+
+        K = xp.zeros((self.size,self.size),dtype=xp.complex128)    
+        P= xp.zeros((self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+        Gamma= xp.zeros((self.tipsize,self.tipsize,self.tipsize,self.L0mat.stack_shape[0]),dtype=xp.complex128)
+
+        K[:self.tipsize,:self.tipsize] = kernel_tip
+        K[self.tipsize:,self.tipsize:] = xp.diag(kernel_diag)[:self.size-self.tipsize]
+
+        for ie in range(self.L0mat.stack_shape[0]):
+            data = self.L0mat.data[ie]
+            coords = (self.L0mat.rows, self.L0mat.cols)
+            L0 = cux.sparse.coo_matrix((data,coords),shape= (self.size, self.size)).todense()
+            A = - L0 @ K + xp.diag(xp.ones(self.size, dtype=xp.complex128))
+            A = xp.linalg.inv(A) @ L0
+            
+            for row in range(self.tipsize):
+                for col in range(self.tipsize):
+                    i=self.table[0,row]
+                    j=self.table[0,col]
+                    P[i,j,ie] = A[row,col]
+
+            for row in range(self.tipsize):
+                i = self.table[0, row]
+                for col in range(self.tipsize, self.size):                        
+                    j = self.table[0,col]
+                    k = self.table[1,col]
+                    Gamma[i,j,k,ie] = A[row, col]        
+        return P, Gamma
 
     def _solve_interacting_twobody(self,V:xp.array,W:xp.array):
         if (self.L0mat.distribution_state != 'stack'):
