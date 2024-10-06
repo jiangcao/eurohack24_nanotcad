@@ -2,7 +2,7 @@ from mpi4py.MPI import COMM_WORLD as comm
 from qttools.datastructures import DSBCOO,DSBSparse
 import numba as nb 
 from scipy import sparse
-from qttools.utils.gpu_utils import xp
+from qttools.utils.gpu_utils import xp, get_host
 import numpy as np
 from cupyx import scipy as cux
 
@@ -64,7 +64,7 @@ class BSESolver():
             print(f"ERROR!, it={offset}, N={self.size}")
 
         # determine number of nnz and sparsity pattern
-        table=self.table.get()
+        table= get_host(self.table)
         self.nnz, coords = BSESolver._get_sparsity(self.size,self.cutoff,table)
         self.rows, self.cols = coords.nonzero()
 
