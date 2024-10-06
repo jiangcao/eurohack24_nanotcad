@@ -4,7 +4,7 @@ import numpy as np
 import cupy as cp
 from bse import BSESolver
 from qttools.utils.gpu_utils import xp
-
+import time
 
 datasetname='/usr/scratch2/tortin16/jiacao/BSE_calc/agnr7/python/test/data_len10_ndiag14_nen600_'
 indata=np.load(datasetname+'input.npz')   
@@ -17,6 +17,8 @@ W=xp.array( indata['W0_r'] ,dtype=xp.complex128)
 
 nm_dev = int(indata['nm_dev'])
 ndiag = int(indata['ndiag'])
+
+start_time = time.time() 
 
 ndiag=2
 bse=BSESolver(nm_dev,ndiag)
@@ -36,3 +38,7 @@ if comm.rank == 0:
 # P, Gamma = bse._solve_interacting_twobody(V,W)
 
 P = bse._densesolve_interacting_twobody(V,W)
+
+finish_time = time.time() 
+
+print('Total compute time = ',finish_time - start_time)
