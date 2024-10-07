@@ -207,7 +207,7 @@ class BSESolver:
                 for col in range(self.tipsize):
                     i = table[0, row]
                     j = table[0, col]
-                    P[i, j, ie] = A[row, col]
+                    P[i, j, ie] = -1j * A[row, col]
 
             for row in range(self.tipsize):
                 i = table[0, row]
