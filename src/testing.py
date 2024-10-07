@@ -3,10 +3,10 @@ from mpi4py.MPI import COMM_WORLD as comm
 import numpy as np
 import cupy as cp
 from bse import BSESolver
-from qttools.utils.gpu_utils import xp
+from qttools.utils.gpu_utils import xp, get_host
 import time
 
-datasetname='/usr/scratch2/tortin16/jiacao/BSE_calc/agnr7/python/test/data_len10_ndiag14_nen600_'
+datasetname='./data_len10_ndiag14_nen600_'
 indata=np.load(datasetname+'input.npz')   
 outdata=np.load(datasetname+'output.npz')   
 
@@ -24,21 +24,39 @@ ndiag=2
 bse=BSESolver(nm_dev,ndiag)
 bse._preprocess()
 
-num_E=100
+num_E=10
 bse._alloc_twobody_matrix(num_E=num_E)
 
 if comm.rank == 0:
-   print('compute correlations ...', flush=True)
+   print('compute correlations ...', flush=True)   
 
 bse._calc_noninteracting_twobody(GG,GL)
 
 if comm.rank == 0:
+   finish_time = time.time()
+   print(' compute time = ',finish_time - start_time)
+   start_time = finish_time
+
    print('solve ...', flush=True)
 
-# P, Gamma = bse._solve_interacting_twobody(V,W)
+P, Gamma = bse._solve_interacting_twobody(V,W)
 
-P = bse._densesolve_interacting_twobody(V,W)
+if comm.rank == 0:
+   finish_time = time.time()
+   print(' compute time = ',finish_time - start_time)
+   start_time = finish_time
 
-finish_time = time.time() 
+   print('dense solve ...', flush=True)
 
-print('Total compute time = ',finish_time - start_time)
+P2, Gamma2 = bse._densesolve_interacting_twobody(V,W)
+
+if comm.rank == 0:
+   finish_time = time.time()
+   print(' compute time = ',finish_time - start_time)
+   start_time = finish_time
+
+print('rank=',comm.rank,'rel error=',np.sum(np.abs(P2-P))/np.sum(np.abs(P2)))
+
+filename=datasetname+'output'
+np.savez(filename+'_rank'+str(comm.rank),
+         P = get_host(P))
