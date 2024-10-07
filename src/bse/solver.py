@@ -33,6 +33,46 @@ class BSESolver:
 
         return nnz, coords
 
+    # Figure out the info to locate the needed nonzero elements (nnz) whichin an interaction range of `ndiag` of
+    # the nnz on the i-th rank.
+    #   - get_nnz_size: number of the nnz to gether
+    #   - get_nnz_idx: indices ...
+    #   - get_nnz_rank: on which ranks ...
+    # For example, this gives all the nnz indices needed by i-th rank, which locates on the j-th rank
+    #   > mask_i_needs_from_j = np.where(get_nnz_rank[i] == j)[-1]
+    #   > nnz_i_needs_from_j = get_nnz_idx[i][mask_i_needs_from_j]
+    def _determine_rank_map_DSBCOO(self, mat: DSBCOO, ndiag):
+        offset = mat.block_offsets
+        num_rank = len(offset)
+        get_nnz_idx = []
+        get_nnz_rank = []
+        get_nnz_size = []
+        for rank in range(num_rank):
+
+            min_row = mat.rows[offset[rank] : offset[rank + 1]].min()
+            max_row = mat.rows[offset[rank] : offset[rank + 1]].max()
+            min_col = mat.cols[offset[rank] : offset[rank + 1]].min()
+            max_col = mat.cols[offset[rank] : offset[rank + 1]].max()
+
+            mask = (
+                (mat.rows > (min_row - ndiag))
+                & (mat.rows < (max_row + ndiag))
+                & (mat.cols > (min_col - ndiag))
+                & (mat.cols < (max_col + ndiag))
+            )
+
+            idx = np.where(mask)[0]
+            idx_in_rank = np.array(
+                [np.where(offset <= ind)[0][-1] for ind in np.where(mask)[0]]
+            )
+
+            get_nnz = np.where(idx_in_rank != rank)[0]
+            get_nnz_idx.append(idx[get_nnz])
+            get_nnz_rank.append(idx_in_rank[get_nnz])
+            get_nnz_size.append(get_nnz.size)
+
+        return get_nnz_size, get_nnz_idx, get_nnz_rank
+
     # preprocessing the sparsity pattern and decide the block_size and
     # num_blocks in the BTA matrix
     def _preprocess(self):
@@ -311,8 +351,7 @@ class BSESolver:
                 A_arrow_tip_block,
             )
 
-            # we need to flip back the BTA matrix output from SerinV (?)
-
+            # first, we need to flip back the BTA matrix output from SerinV
             # extract P from tip of solution matrix L =  A^{-1} @ L0, and P := -i L_tip
             tmp = xp.zeros((self.tipsize, self.tipsize), dtype=xp.complex128)
             tmp = (
@@ -323,7 +362,7 @@ class BSESolver:
             for k in range(self.num_blocks):
                 tmp += (
                     -1j
-                    * xp.flip(X_arrow_right_blocks_serinv[-k, :, :]).reshape(
+                    * xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]).reshape(
                         (self.tipsize, self.blocksize)
                     )
                     @ self.L0mat.stack[ie].blocks[k + 1, 0]
@@ -344,23 +383,23 @@ class BSESolver:
                     @ self.L0mat.stack[ie].blocks[0, k + 1]
                 )
                 tmp2[:, :, k] += (
-                    xp.flip(X_arrow_right_blocks_serinv[-k, :, :]).reshape(
+                    xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]).reshape(
                         (self.tipsize, self.blocksize)
                     )
                     @ self.L0mat.stack[ie].blocks[k + 1, k + 1]
                 )
                 if k > 0:
                     tmp2[:, :, k] += (
-                        xp.flip(X_arrow_right_blocks_serinv[-(k), :, :]).reshape(
-                            (self.tipsize, self.blocksize)
-                        )
+                        xp.flip(
+                            X_arrow_right_blocks_serinv[-(k - 1) - 1, :, :]
+                        ).reshape((self.tipsize, self.blocksize))
                         @ self.L0mat.stack[ie].blocks[k, k + 1]
                     )
                 if k < self.num_blocks - 1:
                     tmp2[:, :, k] += (
-                        xp.flip(X_arrow_right_blocks_serinv[-(k + 1), :, :]).reshape(
-                            (self.tipsize, self.blocksize)
-                        )
+                        xp.flip(
+                            X_arrow_right_blocks_serinv[-(k + 1) - 1, :, :]
+                        ).reshape((self.tipsize, self.blocksize))
                         @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
                     )
 
