@@ -1,62 +1,61 @@
-# %%
-from mpi4py.MPI import COMM_WORLD as comm
-import numpy as np
-import cupy as cp
-from bse import BSESolver
-from qttools.utils.gpu_utils import xp, get_host
 import time
 
-datasetname='./data_len10_ndiag14_nen600_'
-indata=np.load(datasetname+'input.npz')   
-outdata=np.load(datasetname+'output.npz')   
+import numpy as np
+from mpi4py.MPI import COMM_WORLD as comm
+from qttools.utils.gpu_utils import get_host, xp
 
-V=xp.array( indata['coulomb'] ,dtype=xp.complex128)
-GL=xp.array( indata['G_lesser'] ,dtype=xp.complex128)
-GG=xp.array( indata['G_greater'] ,dtype=xp.complex128)
-W=xp.array( indata['W0_r'] ,dtype=xp.complex128)
+from bse import BSESolver
 
-nm_dev = int(indata['nm_dev'])
-ndiag = int(indata['ndiag'])
+datasetname = "/usr/scratch2/tortin16/jiacao/BSE_calc/agnr7/python/test/data_len10_ndiag14_nen600_"
+indata = np.load(datasetname + "input.npz")
+outdata = np.load(datasetname + "output.npz")
 
-start_time = time.time() 
+V = xp.array(indata["coulomb"], dtype=xp.complex128)
+GL = xp.array(indata["G_lesser"], dtype=xp.complex128)
+GG = xp.array(indata["G_greater"], dtype=xp.complex128)
+W = xp.array(indata["W0_r"], dtype=xp.complex128)
 
-ndiag=2
-bse=BSESolver(nm_dev,ndiag)
+nm_dev = int(indata["nm_dev"])
+ndiag = int(indata["ndiag"])
+
+start_time = time.time()
+
+ndiag = 2
+bse = BSESolver(nm_dev, ndiag)
 bse._preprocess()
 
-num_E=10
+num_E = 10
 bse._alloc_twobody_matrix(num_E=num_E)
 
 if comm.rank == 0:
-   print('compute correlations ...', flush=True)   
+    print("compute correlations ...", flush=True)
 
-bse._calc_noninteracting_twobody(GG,GL)
-
-if comm.rank == 0:
-   finish_time = time.time()
-   print(' compute time = ',finish_time - start_time)
-   start_time = finish_time
-
-   print('solve ...', flush=True)
-
-P, Gamma = bse._solve_interacting_twobody(V,W)
+bse._calc_noninteracting_twobody(GG, GL)
 
 if comm.rank == 0:
-   finish_time = time.time()
-   print(' compute time = ',finish_time - start_time)
-   start_time = finish_time
+    finish_time = time.time()
+    print(" compute time = ", finish_time - start_time)
+    start_time = finish_time
 
-   print('dense solve ...', flush=True)
+    print("solve ...", flush=True)
 
-P2, Gamma2 = bse._densesolve_interacting_twobody(V,W)
+P, Gamma = bse._solve_interacting_twobody(V, W)
 
 if comm.rank == 0:
-   finish_time = time.time()
-   print(' compute time = ',finish_time - start_time)
-   start_time = finish_time
+    finish_time = time.time()
+    print(" compute time = ", finish_time - start_time)
+    start_time = finish_time
 
-print('rank=',comm.rank,'rel error=',np.sum(np.abs(P2-P))/np.sum(np.abs(P2)))
+    print("dense solve ...", flush=True)
 
-filename=datasetname+'output'
-np.savez(filename+'_rank'+str(comm.rank),
-         P = get_host(P))
+P2, Gamma2 = bse._densesolve_interacting_twobody(V, W)
+
+if comm.rank == 0:
+    finish_time = time.time()
+    print(" compute time = ", finish_time - start_time)
+    start_time = finish_time
+
+print("rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2)))
+
+filename = datasetname + "output"
+np.savez(filename + "_rank" + str(comm.rank), P=get_host(P))
