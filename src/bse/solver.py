@@ -65,10 +65,10 @@ class BSESolver:
                 & (mat.cols < (max_col + ndiag))
             )
 
-            idx = np.where(mask)[0]
-            idx_in_rank = np.array([np.where(offset <= ind)[0][-1] for ind in idx])
+            idx = xp.where(mask)[0]
+            idx_in_rank = xp.array([xp.where(offset <= ind)[0][-1] for ind in idx])
 
-            get_nnz = np.where(idx_in_rank != rank)[0]
+            get_nnz = xp.where(idx_in_rank != rank)[0]
             get_nnz_idx.append(idx[get_nnz])
             get_nnz_rank.append(idx_in_rank[get_nnz])
             get_nnz_size.append(get_nnz.size)
@@ -365,7 +365,7 @@ class BSESolver:
             # extract P from tip of solution matrix L =  A^{-1} @ L0, and P := -i L_tip
             tmp = (
                 -1j
-                * xp.transpose(np.flip(X_arrow_tip_block_serinv))
+                * xp.transpose(xp.flip(X_arrow_tip_block_serinv))
                 @ self.L0mat.stack[ie].blocks[0, 0]
             )
             for k in range(self.num_blocks):
