@@ -18,7 +18,7 @@ GL = xp.array(indata["G_lesser"], dtype=xp.complex128)
 GG = xp.array(indata["G_greater"], dtype=xp.complex128)
 
 # Prepare data.
-ndiag = 4
+ndiag = 2
 for i, j in np.ndindex(GL.shape[:-1]):
     if np.abs(i - j) > ndiag:
         GL[i, j] = 0
@@ -50,9 +50,9 @@ nm_dev = int(indata["nm_dev"])
 
 start_time = time.time()
 
-bse = BSESolverDist(nm_dev, ndiag // 2)
+bse = BSESolverDist(nm_dev, ndiag)
 
-bse._preprocess(rows=g_lesser.rows, cols=g_lesser.cols)
+bse._preprocess()
 
 num_E = 10
 bse._alloc_twobody_matrix(num_E=num_E)

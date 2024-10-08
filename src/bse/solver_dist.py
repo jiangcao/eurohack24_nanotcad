@@ -55,16 +55,16 @@ class BSESolverDist:
         get_nnz_size = []
         for rank in range(num_rank):
 
-            min_row = rows[offset[rank] : offset[rank + 1]].min()
-            max_row = rows[offset[rank] : offset[rank + 1]].max()
-            min_col = cols[offset[rank] : offset[rank + 1]].min()
-            max_col = cols[offset[rank] : offset[rank + 1]].max()
+            min_row = rows[offset[rank] : offset[rank + 1]].min() - ndiag - 1
+            max_row = rows[offset[rank] : offset[rank + 1]].max() + ndiag + 1
+            min_col = cols[offset[rank] : offset[rank + 1]].min() - ndiag - 1
+            max_col = cols[offset[rank] : offset[rank + 1]].max() + ndiag + 1
 
             mask = (
-                (rows > (min_row - ndiag))
-                & (rows < (max_row + ndiag))
-                & (cols > (min_col - ndiag))
-                & (cols < (max_col + ndiag))
+                (rows > min_row)
+                & (rows < max_row)
+                & (cols > min_col)
+                & (cols < max_col)
             )
 
             idx = xp.where(mask)[0]
@@ -77,19 +77,28 @@ class BSESolverDist:
 
         return get_nnz_size, get_nnz_idx, get_nnz_rank
 
-    def _preprocess(self, rows: xp.ndarray, cols: xp.ndarray):
+    def _preprocess(self):
         """Computes some the sparsity pattern and the block-size."""
         # Sets self.size, self.table, self.inverse_table, self.nnz, self.rows, self.cols
         self._preprocess_bta()
-
-        self.table_dist = xp.vstack((rows, cols))
-
+        self.table_dist = xp.zeros((2, self.size), dtype=xp.int32)
+        self.inverse_table_dist = (
+            xp.zeros((self.num_sites, self.num_sites), dtype=xp.int32) * xp.nan
+        )
+        offset = 0
+        for i in range(self.num_sites):
+            l = max(0, i - self.cutoff)
+            k = min(self.num_sites - 1, i + self.cutoff)
+            for j in range(l, k + 1):
+                self.table_dist[0, offset] = i
+                self.table_dist[1, offset] = j
+                self.inverse_table_dist[i, j] = offset
+                offset += 1
+        assert offset == self.size
         nnz, coords_dist = BSESolverDist._get_sparsity(
             self.size, self.cutoff, get_host(self.table_dist)
         )
-
-        # assert nnz == self.nnz
-
+        self.nnz = nnz
         self.rows_dist, self.cols_dist = coords_dist.nonzero()
 
     # preprocessing the sparsity pattern and decide the block_size and
@@ -182,9 +191,6 @@ class BSESolverDist:
 
         G_nen = GG.data.shape[0]
 
-        print(f"GG shape={GG.data.shape}", flush=True)
-        print(f"GG distribution={GG.distribution_state}", flush=True)
-
         get_nnz_size, get_nnz_idx, get_nnz_rank = BSESolverDist._determine_rank_map(
             GG.nnz_section_offsets,
             self.cutoff,
@@ -256,12 +262,6 @@ class BSESolverDist:
             status = MPI.Status()
             print("gl error:", status.error, flush=True)
 
-        print(
-            f"rank {comm.rank}:\n",
-            [gg.shape for gg in gg_buffer if gg is not None],
-            flush=True,
-        )
-
         if comm.size > 1:
             gg_buffer = xp.concatenate(
                 [xp.array(gg) for gg in gg_buffer if gg is not None], axis=-1
@@ -270,54 +270,49 @@ class BSESolverDist:
                 [xp.array(gl) for gl in gl_buffer if gl is not None], axis=-1
             )
 
-            print(f"rank {comm.rank}:\n", gl_buffer.shape, flush=True)
-
         start_inz = int(self.L0mat.nnz_section_offsets[comm.rank])
         end_inz = int(self.L0mat.nnz_section_offsets[comm.rank + 1])
         for inz in range(start_inz, end_inz):
             row = self.L0mat.rows[inz]
             col = self.L0mat.cols[inz]
 
-            i = self.table_dist[row, 0]
-            j = self.table_dist[row, 1]
-            k = self.table_dist[col, 0]
-            l = self.table_dist[col, 1]
-
-            # print(f"rank {comm.rank}:", i,j,k,l, flush=True)
+            i = self.table_dist[0, row]
+            j = self.table_dist[1, row]
+            k = self.table_dist[0, col]
+            l = self.table_dist[1, col]
 
             ind_ik = xp.where((GG.rows == i) & (GG.cols == k))[0]
-            rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
-            # print(f"ind_ik={ind_ik}")
+            # could happen that G_{ik} is zero, so ind_ik becomes empty list
+            # print(ind_ik)
+            if len(ind_ik) > 0:
+                rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
+                if comm.rank == rank_ik:
+                    gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
+                    gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
+                else:
+                    ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
+                    gg_ik = gg_buffer[..., ind[0]]
+                    gl_ik = gl_buffer[..., ind[0]]
+
             ind_lj = xp.where((GL.rows == l) & (GL.cols == j))[0]
-            # print(f"ind_lj={ind_lj}")
-            rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
-
-            if comm.rank == rank_ik:
-                gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
-                gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
+            # print(ind_lj)
+            # could happen that the G_{lj} is zero so not found in G
+            if len(ind_lj) > 0:
+                rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
+                if comm.rank == rank_lj:
+                    gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
+                    gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
+                else:
+                    ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
+                    gg_lj = gg_buffer[..., ind[0]]
+                    gl_lj = gl_buffer[..., ind[0]]
+            if (len(ind_ik) > 0) and (len(ind_lj) > 0):
+                L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
+                self.L0mat[row, col] = L_ijkl[
+                    G_nen : G_nen + self.num_E * step_E : step_E
+                ]
             else:
-                ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
-                print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-                print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-                print(f"rank {comm.rank}:", ind_ik, flush=True)
-                gg_ik = gg_buffer[..., ind[0]]
-                gl_ik = gl_buffer[..., ind[0]]
-
-            if comm.rank == rank_lj:
-                gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
-                gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
-            else:
-                ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
-                print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-                print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-                print(f"rank {comm.rank}:", ind_lj, flush=True)
-                gg_lj = gg_buffer[..., ind[0]]
-                gl_lj = gl_buffer[..., ind[0]]
-
-            # print(row,col,i,j,k,l)
-
-            L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
-            self.L0mat[row, col] = L_ijkl[G_nen : G_nen + self.num_E * step_E : step_E]
+                self.L0mat[row, col] = xp.array([0] * self.num_E, dtype=xp.complex128)
 
         # transpose to stack distribution
         self.L0mat.dtranspose()
