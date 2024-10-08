@@ -39,9 +39,13 @@ class BSESolver:
     #   - get_nnz_idx: indices ...
     #   - get_nnz_rank: on which ranks ...
     # For example, this gives all the nnz indices needed by i-th rank, which locates on the j-th rank
-    #   > mask_i_needs_from_j = np.where(get_nnz_rank[i] == j)[-1]
+    #   > mask_i_needs_from_j = np.where(get_nnz_rank[i] == j)[0]
     #   > nnz_i_needs_from_j = get_nnz_idx[i][mask_i_needs_from_j]
-    def _determine_rank_map_DSBCOO(self, mat: DSBCOO, ndiag):
+    def _determine_rank_map_DSBCOO(self, mat: DSBCOO, ndiag: int):
+        """
+        Figure out the info to locate the needed nonzero elements (nnz) whichin an interaction range of `ndiag` of
+        the nnz on the i-th rank.
+        """
         offset = mat.block_offsets
         num_rank = len(offset)
         get_nnz_idx = []
@@ -62,9 +66,7 @@ class BSESolver:
             )
 
             idx = np.where(mask)[0]
-            idx_in_rank = np.array(
-                [np.where(offset <= ind)[0][-1] for ind in np.where(mask)[0]]
-            )
+            idx_in_rank = np.array([np.where(offset <= ind)[0][-1] for ind in idx])
 
             get_nnz = np.where(idx_in_rank != rank)[0]
             get_nnz_idx.append(idx[get_nnz])
@@ -122,6 +124,9 @@ class BSESolver:
         self.totalsize = self.arrowsize + self.tipsize
 
         if comm.rank == 0:
+            print("  N =", self.num_sites, flush=True)
+            print("  N^2 =", self.num_sites**2, flush=True)
+            print("  resized size =", self.totalsize, flush=True)
             print("  total arrow size=", self.arrowsize, flush=True)
             print("  arrow bandwidth=", bandwidth, flush=True)
             print("  arrow block size=", self.blocksize, flush=True)
@@ -152,7 +157,7 @@ class BSESolver:
             self.L0mat.dtranspose()
         return
 
-    def _calc_noninteracting_twobody(self, GG: xp.array, GL: xp.array):
+    def _calc_noninteracting_twobody(self, GG: xp.array, GL: xp.array, step_E: int):
         if self.L0mat.distribution_state == "stack":
             self.L0mat.dtranspose()
         nnz_section_offsets = np.hstack(([0], np.cumsum(self.L0mat.nnz_section_sizes)))
@@ -174,7 +179,7 @@ class BSESolver:
             L_ijkl = correlate(GG[i, k, :], GL[l, j, :]) - correlate(
                 GL[i, k, :], GG[l, j, :]
             )
-            self.L0mat[row, col] = L_ijkl[G_nen : G_nen + self.num_E]
+            self.L0mat[row, col] = L_ijkl[G_nen : G_nen + self.num_E * step_E : step_E]
 
         # transpose to stack distribution
         self.L0mat.dtranspose()
@@ -193,19 +198,10 @@ class BSESolver:
             )
         )
 
-        # for row in range(self.num_sites):
-        #     for col in range(self.num_sites):
-        #         i=self.table[0,row]
-        #         k=self.table[0,col]
-        #         print(V[i,k])
-        #         kernel_tip[row,col] += - V[i,k]
-        #         if (row == col):
-        #             kernel_tip[row,col] += W[i,i]
-        for row in range(self.num_sites, self.totalsize):
-            if row < self.size:
-                i = self.table[0, row]
-                j = self.table[1, row]
-                kernel_diag[row - self.tipsize] += W[i, j]
+        for row in range(self.tipsize, self.size):
+            i = self.table[0, row]
+            j = self.table[1, row]
+            kernel_diag[row - self.tipsize] += W[i, j]
         kernel_diag *= 1j
         kernel_tip *= 1j
         return kernel_tip, kernel_diag
@@ -214,13 +210,11 @@ class BSESolver:
         if self.L0mat.distribution_state != "stack":
             self.L0mat.dtranspose()
         kernel_tip, kernel_diag = self._calc_kernel(V, W)
-
+        local_nen = self.L0mat.stack_shape[0]
         K = xp.zeros((self.size, self.size), dtype=xp.complex128)
-        P = xp.zeros(
-            (self.tipsize, self.tipsize, self.L0mat.stack_shape[0]), dtype=xp.complex128
-        )
+        P = xp.zeros((self.tipsize, self.tipsize, local_nen), dtype=xp.complex128)
         Gamma = xp.zeros(
-            (self.tipsize, self.tipsize, self.tipsize, self.L0mat.stack_shape[0]),
+            (self.tipsize, self.tipsize, self.tipsize, local_nen),
             dtype=xp.complex128,
         )
 
@@ -230,7 +224,6 @@ class BSESolver:
         )
 
         table = self.table
-        local_nen = self.L0mat.stack_shape[0]
 
         for ie in range(local_nen):
             print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
@@ -241,7 +234,12 @@ class BSESolver:
             ).todense()
 
             A = -L0 @ K + xp.diag(xp.ones(self.size, dtype=xp.complex128))
-            A = xp.linalg.inv(A) @ L0
+            invA = xp.linalg.inv(A)
+            # impose sparsity pattern of BTA, for a proper comparison with selected inversion
+            invA_bta = _impose_bta_sparsity(
+                invA, self.blocksize, self.tipsize, self.num_blocks
+            )
+            A = invA_bta @ L0
 
             for row in range(self.tipsize):
                 for col in range(self.tipsize):
@@ -263,6 +261,10 @@ class BSESolver:
 
         kernel_tip, kernel_diag = self._calc_kernel(V, W)
 
+        K = xp.zeros((self.totalsize, self.totalsize), dtype=xp.complex128)
+        K[: self.tipsize, : self.tipsize] = kernel_tip
+        K[self.tipsize :, self.tipsize :] = np.diag(kernel_diag)
+
         A_arrow_right_blocks = xp.zeros(
             (self.num_blocks, self.blocksize, self.tipsize), dtype=xp.complex128
         )
@@ -279,60 +281,68 @@ class BSESolver:
             (self.num_blocks - 1, self.blocksize, self.blocksize), dtype=xp.complex128
         )
 
-        P = xp.zeros(
-            (self.tipsize, self.tipsize, self.L0mat.stack_shape[0]), dtype=xp.complex128
-        )
+        local_nen = self.L0mat.stack_shape[0]
+        P = xp.zeros((self.tipsize, self.tipsize, local_nen), dtype=xp.complex128)
         Gamma = xp.zeros(
-            (self.tipsize, self.tipsize, self.tipsize, self.L0mat.stack_shape[0]),
+            (self.tipsize, self.tipsize, self.tipsize, local_nen),
             dtype=xp.complex128,
         )
-        local_nen = self.L0mat.stack_shape[0]
 
         for ie in range(local_nen):
             print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
             # build system matrix: A = I - L0 @ K
             # Note: SerinV takes BTA pointing down, so the block ordering should be reversed and
-            #       each block matrix should be flipped.
-
-            A_arrow_tip_block = xp.flip(
-                -self.L0mat.stack[ie].blocks[0, 0] @ kernel_tip + xp.eye(self.tipsize)
+            #       each block matrix should be transposed and flipped.
+            A_arrow_tip_block = xp.transpose(
+                xp.flip(
+                    -self.L0mat.stack[ie].blocks[0, 0] @ kernel_tip
+                    + xp.eye(self.tipsize)
+                )
             )
 
             for k in range(self.num_blocks):
-                A_diagonal_blocks[-k - 1, :, :] = xp.flip(
-                    -self.L0mat.stack[ie].blocks[k + 1, k + 1]
-                    @ xp.diag(
-                        kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
+                A_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                    xp.flip(
+                        -self.L0mat.stack[ie].blocks[k + 1, k + 1]
+                        @ xp.diag(
+                            kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
+                        )
                     )
                     + xp.eye(self.blocksize)
                 )
 
             for k in range(self.num_blocks - 1):
-                A_upper_diagonal_blocks[-k - 1, :, :] = xp.flip(
-                    -self.L0mat.stack[ie].blocks[k + 1, k + 2]
-                    @ xp.diag(
-                        kernel_diag[self.blocksize * (k + 1) : self.blocksize * (k + 2)]
+                A_upper_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                    xp.flip(
+                        -self.L0mat.stack[ie].blocks[k + 1, k + 2]
+                        @ xp.diag(
+                            kernel_diag[
+                                self.blocksize * (k + 1) : self.blocksize * (k + 2)
+                            ]
+                        )
                     )
                 )
-                A_lower_diagonal_blocks[-k - 1, :, :] = xp.flip(
-                    -self.L0mat.stack[ie].blocks[k + 2, k + 1]
-                    @ xp.diag(
-                        kernel_diag[self.blocksize * (k) : self.blocksize * (k + 1)]
+                A_lower_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                    xp.flip(
+                        -self.L0mat.stack[ie].blocks[k + 2, k + 1]
+                        @ xp.diag(
+                            kernel_diag[self.blocksize * (k) : self.blocksize * (k + 1)]
+                        )
                     )
                 )
 
             for k in range(self.num_blocks):
-                A_arrow_bottom_blocks[-k - 1, :, :] = xp.flip(
-                    -self.L0mat.stack[ie].blocks[k + 1, 0] @ kernel_tip
-                ).reshape((self.tipsize, self.blocksize))
-                A_arrow_right_blocks[-k - 1, :, :] = xp.flip(
-                    -self.L0mat.stack[ie].blocks[0, k + 1]
-                    @ xp.diag(
-                        kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
+                A_arrow_bottom_blocks[-k - 1, :, :] = xp.transpose(
+                    xp.flip(-self.L0mat.stack[ie].blocks[k + 1, 0] @ kernel_tip)
+                )
+                A_arrow_right_blocks[-k - 1, :, :] = xp.transpose(
+                    xp.flip(
+                        -self.L0mat.stack[ie].blocks[0, k + 1]
+                        @ xp.diag(
+                            kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
+                        )
                     )
-                ).reshape((self.blocksize, self.tipsize))
-
-            # need to flip the BTA matrix before calling solver (?)
+                )
 
             # solve system matrix
             (
@@ -351,20 +361,17 @@ class BSESolver:
                 A_arrow_tip_block,
             )
 
-            # first, we need to flip back the BTA matrix output from SerinV
+            # first, we need to transpose and flip back the BTA matrix output from SerinV
             # extract P from tip of solution matrix L =  A^{-1} @ L0, and P := -i L_tip
-            tmp = xp.zeros((self.tipsize, self.tipsize), dtype=xp.complex128)
             tmp = (
                 -1j
-                * xp.flip(X_arrow_tip_block_serinv)
+                * xp.transpose(np.flip(X_arrow_tip_block_serinv))
                 @ self.L0mat.stack[ie].blocks[0, 0]
             )
             for k in range(self.num_blocks):
                 tmp += (
                     -1j
-                    * xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]).reshape(
-                        (self.tipsize, self.blocksize)
-                    )
+                    * xp.transpose(xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]))
                     @ self.L0mat.stack[ie].blocks[k + 1, 0]
                 )
             for row in range(self.tipsize):
@@ -379,27 +386,25 @@ class BSESolver:
             )
             for k in range(self.num_blocks):
                 tmp2[:, :, k] += (
-                    xp.flip(X_arrow_tip_block_serinv)
+                    xp.transpose(xp.flip(X_arrow_tip_block_serinv))
                     @ self.L0mat.stack[ie].blocks[0, k + 1]
                 )
                 tmp2[:, :, k] += (
-                    xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]).reshape(
-                        (self.tipsize, self.blocksize)
-                    )
+                    xp.transpose(xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]))
                     @ self.L0mat.stack[ie].blocks[k + 1, k + 1]
                 )
                 if k > 0:
                     tmp2[:, :, k] += (
-                        xp.flip(
-                            X_arrow_right_blocks_serinv[-(k - 1) - 1, :, :]
-                        ).reshape((self.tipsize, self.blocksize))
+                        xp.transpose(
+                            xp.flip(X_arrow_right_blocks_serinv[-(k - 1) - 1, :, :])
+                        )
                         @ self.L0mat.stack[ie].blocks[k, k + 1]
                     )
                 if k < self.num_blocks - 1:
                     tmp2[:, :, k] += (
-                        xp.flip(
-                            X_arrow_right_blocks_serinv[-(k + 1) - 1, :, :]
-                        ).reshape((self.tipsize, self.blocksize))
+                        xp.transpose(
+                            xp.flip(X_arrow_right_blocks_serinv[-(k + 1) - 1, :, :])
+                        )
                         @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
                     )
 
@@ -463,3 +468,26 @@ def correlate(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
 
     """
     return fftconvolve(a, b[::-1])
+
+
+def _impose_bta_sparsity(
+    a: xp.ndarray,
+    diagonal_blocksize: int,
+    arrowhead_blocksize: int,
+    n_diag_blocks: int,
+):
+    """Impose a block tridiagonal arrowhead sparsity to a dense array."""
+
+    bta = a.copy()
+    for i in range(n_diag_blocks):
+        for j in range(n_diag_blocks):
+            if abs(i - j) > 1:
+                bta[
+                    arrowhead_blocksize
+                    + diagonal_blocksize * i : arrowhead_blocksize
+                    + diagonal_blocksize * (i + 1),
+                    arrowhead_blocksize
+                    + diagonal_blocksize * j : arrowhead_blocksize
+                    + diagonal_blocksize * (j + 1),
+                ] = 0
+    return bta
