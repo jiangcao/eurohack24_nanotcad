@@ -1,3 +1,5 @@
+import time
+
 import numba as nb
 import numpy as np
 from cupyx.scipy import sparse as cusparse
@@ -181,13 +183,18 @@ class BSESolverDist:
             self.L0mat_dist.dtranspose()
         return
 
-    def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int):
+    def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int = 1):
+        start_time = time.time()
         if self.L0mat_dist.distribution_state == "stack":
             self.L0mat_dist.dtranspose()
         if GG.distribution_state == "stack":
             GG.dtranspose()
         if GL.distribution_state == "stack":
             GL.dtranspose()
+        finish_time = time.time()
+        if comm.rank == 0:
+            print(" dtranspose time=", finish_time - start_time, flush=True)
+        start_time = finish_time
 
         G_nen = GG.data.shape[0]
 
@@ -270,6 +277,16 @@ class BSESolverDist:
                 [xp.array(gl) for gl in gl_buffer if gl is not None], axis=-1
             )
 
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "MPI send recv time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
         start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
         end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
         for inz in range(start_inz, end_inz):
@@ -316,8 +333,31 @@ class BSESolverDist:
                     [0] * self.num_E, dtype=xp.complex128
                 )
 
+        finish_time = time.time()
+        print(
+            " rank ", comm.rank, "compute time=", finish_time - start_time, flush=True
+        )
+        start_time = finish_time
+
+        comm.barrier()
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "barrier waiting time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
         # transpose to stack distribution
         self.L0mat_dist.dtranspose()
+
+        finish_time = time.time()
+        if comm.rank == 0:
+            print(" dtranspose time=", finish_time - start_time, flush=True)
+        start_time = finish_time
 
         # reorder L0mat to BTA shape
         # !!! an additional L0mat gets allocated temporarily !!!
@@ -343,6 +383,17 @@ class BSESolverDist:
             self.L0mat.data[..., inz] = self.L0mat_dist[row_dist, col_dist]
 
         del self.L0mat_dist
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "reorder L to BTA matrix time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
         return
 
     def _calc_kernel(self, V: xp.array, W: xp.array):

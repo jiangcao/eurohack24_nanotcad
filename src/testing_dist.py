@@ -18,7 +18,7 @@ GL = xp.array(indata["G_lesser"], dtype=xp.complex128)
 GG = xp.array(indata["G_greater"], dtype=xp.complex128)
 
 # Prepare data.
-ndiag = 2
+ndiag = 4
 for i, j in np.ndindex(GL.shape[:-1]):
     if np.abs(i - j) > ndiag:
         GL[i, j] = 0
@@ -76,6 +76,8 @@ if comm.rank == 0:
 
 bse._calc_noninteracting_twobody(g_greater, g_lesser, step_E=20)
 
+comm.barrier()
+
 if comm.rank == 0:
     finish_time = time.time()
     print(" compute time = ", finish_time - start_time)
@@ -84,6 +86,8 @@ if comm.rank == 0:
     print("solve ...", flush=True)
 
 P, Gamma = bse._solve_interacting_twobody(V, W)
+
+comm.barrier()
 
 if comm.rank == 0:
     finish_time = time.time()
@@ -94,12 +98,16 @@ if comm.rank == 0:
 
 P2, Gamma2 = bse._densesolve_interacting_twobody(V, W)
 
+comm.barrier()
+
 if comm.rank == 0:
     finish_time = time.time()
     print(" compute time = ", finish_time - start_time)
     start_time = finish_time
 
-print("rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2)))
+print(
+    "rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2))
+), "abs error=", np.sum(np.abs(P2 - P))
 
 # filename = datasetname + "output"
 # np.savez(filename + "_rank" + str(comm.rank), P=get_host(P))
