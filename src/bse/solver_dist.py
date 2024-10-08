@@ -174,16 +174,16 @@ class BSESolverDist:
         data = np.zeros(len(self.rows_dist), dtype=xp.complex128)
         coords = (self.rows_dist, self.cols_dist)
         coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
-        self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
+        self.L0mat_dist = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
         del self.rows_dist
         del self.cols_dist
-        if self.L0mat.distribution_state == "stack":
-            self.L0mat.dtranspose()
+        if self.L0mat_dist.distribution_state == "stack":
+            self.L0mat_dist.dtranspose()
         return
 
     def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int):
-        if self.L0mat.distribution_state == "stack":
-            self.L0mat.dtranspose()
+        if self.L0mat_dist.distribution_state == "stack":
+            self.L0mat_dist.dtranspose()
         if GG.distribution_state == "stack":
             GG.dtranspose()
         if GL.distribution_state == "stack":
@@ -270,11 +270,11 @@ class BSESolverDist:
                 [xp.array(gl) for gl in gl_buffer if gl is not None], axis=-1
             )
 
-        start_inz = int(self.L0mat.nnz_section_offsets[comm.rank])
-        end_inz = int(self.L0mat.nnz_section_offsets[comm.rank + 1])
+        start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
+        end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
         for inz in range(start_inz, end_inz):
-            row = self.L0mat.rows[inz]
-            col = self.L0mat.cols[inz]
+            row = self.L0mat_dist.rows[inz]
+            col = self.L0mat_dist.cols[inz]
 
             i = self.table_dist[0, row]
             j = self.table_dist[1, row]
@@ -308,14 +308,41 @@ class BSESolverDist:
                     gl_lj = gl_buffer[..., ind[0]]
             if (len(ind_ik) > 0) and (len(ind_lj) > 0):
                 L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
-                self.L0mat[row, col] = L_ijkl[
+                self.L0mat_dist[row, col] = L_ijkl[
                     G_nen : G_nen + self.num_E * step_E : step_E
                 ]
             else:
-                self.L0mat[row, col] = xp.array([0] * self.num_E, dtype=xp.complex128)
+                self.L0mat_dist[row, col] = xp.array(
+                    [0] * self.num_E, dtype=xp.complex128
+                )
 
         # transpose to stack distribution
-        self.L0mat.dtranspose()
+        self.L0mat_dist.dtranspose()
+
+        # reorder L0mat to BTA shape
+        # !!! an additional L0mat gets allocated temporarily !!!
+        ARRAY_SHAPE = (self.totalsize, self.totalsize)
+        BLOCK_SIZES = np.concatenate(
+            [[self.tipsize], self.blocksize * np.ones(self.num_blocks, dtype=int)]
+        )
+        GLOBAL_STACK_SHAPE = (self.num_E,)
+        data = np.zeros(len(self.rows), dtype=xp.complex128)
+        coords = (self.rows, self.cols)
+        coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
+        self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
+        del self.rows
+        del self.cols
+
+        for inz in range(self.nnz):
+            row = self.L0mat.rows[inz]
+            col = self.L0mat.cols[inz]
+            i, j = self.table[:, row]
+            k, l = self.table[:, col]
+            row_dist = self.inverse_table_dist[i, j]
+            col_dist = self.inverse_table_dist[k, l]
+            self.L0mat.data[..., inz] = self.L0mat_dist[row_dist, col_dist]
+
+        del self.L0mat_dist
         return
 
     def _calc_kernel(self, V: xp.array, W: xp.array):

@@ -81,25 +81,25 @@ if comm.rank == 0:
     print(" compute time = ", finish_time - start_time)
     start_time = finish_time
 
-#     print("solve ...", flush=True)
+    print("solve ...", flush=True)
 
-# P, Gamma = bse._solve_interacting_twobody(V, W)
+P, Gamma = bse._solve_interacting_twobody(V, W)
 
-# if comm.rank == 0:
-#     finish_time = time.time()
-#     print(" compute time = ", finish_time - start_time)
-#     start_time = finish_time
+if comm.rank == 0:
+    finish_time = time.time()
+    print(" compute time = ", finish_time - start_time)
+    start_time = finish_time
 
-#     print("dense solve ...", flush=True)
+    print("dense solve ...", flush=True)
 
-# P2, Gamma2 = bse._densesolve_interacting_twobody(V, W)
+P2, Gamma2 = bse._densesolve_interacting_twobody(V, W)
 
-# if comm.rank == 0:
-#     finish_time = time.time()
-#     print(" compute time = ", finish_time - start_time)
-#     start_time = finish_time
+if comm.rank == 0:
+    finish_time = time.time()
+    print(" compute time = ", finish_time - start_time)
+    start_time = finish_time
 
-# print("rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2)))
+print("rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2)))
 
 # filename = datasetname + "output"
 # np.savez(filename + "_rank" + str(comm.rank), P=get_host(P))
