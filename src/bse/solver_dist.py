@@ -3,11 +3,10 @@ import time
 import numba as nb
 import numpy as np
 from cupyx.scipy import sparse as cusparse
-from mpi4py import MPI
 from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.MPI import Request
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import get_host, xp
+from qttools.utils.gpu_utils import get_device, get_host, xp
 from scipy import sparse
 from serinv.algs import ddbtasinv
 
@@ -37,6 +36,17 @@ class BSESolverDist:
 
         return nnz, coords
 
+    @nb.njit(parallel=True, fastmath=True)
+    def _compute_permutation(
+        perm_rows: np.ndarray, perm_cols: np.ndarray, rows: np.ndarray, cols: np.ndarray
+    ):
+        permutation = np.zeros_like(rows, dtype=np.int32)
+        for i in nb.prange(rows.size):
+            mask = (perm_rows == rows[i]) & (perm_cols == cols[i])
+            permutation[i] = np.where(mask)[0][0]
+
+        return permutation
+
     # Figure out the info to locate the needed nonzero elements (nnz) whichin an interaction range of `ndiag` of
     # the nnz on the i-th rank.
     #   - get_nnz_size: number of the nnz to gether
@@ -57,16 +67,16 @@ class BSESolverDist:
         get_nnz_size = []
         for rank in range(num_rank):
 
-            min_row = rows[offset[rank] : offset[rank + 1]].min() - ndiag - 1
-            max_row = rows[offset[rank] : offset[rank + 1]].max() + ndiag + 1
-            min_col = cols[offset[rank] : offset[rank + 1]].min() - ndiag - 1
-            max_col = cols[offset[rank] : offset[rank + 1]].max() + ndiag + 1
+            min_row = rows[offset[rank] : offset[rank + 1]].min() - ndiag
+            max_row = rows[offset[rank] : offset[rank + 1]].max() + ndiag
+            min_col = cols[offset[rank] : offset[rank + 1]].min() - ndiag
+            max_col = cols[offset[rank] : offset[rank + 1]].max() + ndiag
 
             mask = (
-                (rows > min_row)
-                & (rows < max_row)
-                & (cols > min_col)
-                & (cols < max_col)
+                (rows >= min_row)
+                & (rows <= max_row)
+                & (cols >= min_col)
+                & (cols <= max_col)
             )
 
             idx = xp.where(mask)[0]
@@ -205,10 +215,60 @@ class BSESolverDist:
             GG.cols,
         )
 
-        gg_buffer = [None] * comm.size
-        gl_buffer = [None] * comm.size
+        gg_recbuf = [None] * comm.size
+        gl_recbuf = [None] * comm.size
+        gg_sendbuf = [None] * comm.size
+        gl_sendbuf = [None] * comm.size
+
+        for j in reversed(range(comm.size)):
+            if j == comm.rank:
+                continue
+            inds_rank_to_j = get_nnz_idx[j][get_nnz_rank[j] == comm.rank]
+            if not inds_rank_to_j.any():
+                continue
+
+            gg_sendbuf[j] = np.zeros(
+                (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+            )
+            gl_sendbuf[j] = np.zeros(
+                (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+            )
 
         reqs_gg = []
+        for i in range(comm.size):
+            if i == comm.rank:
+                continue
+            mask_buffer = get_nnz_rank[comm.rank] == i
+            if not mask_buffer.any():
+                continue
+
+            gg_recbuf[i] = np.zeros(
+                (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+            )
+
+            print(f"Posting receive {i}-->{comm.rank}", flush=True)
+
+            reqs_gg.append(comm.Irecv(gg_recbuf[i], source=i, tag=0))
+
+        for j in reversed(range(comm.size)):
+            if j == comm.rank:
+                continue
+            inds_rank_to_j = get_nnz_idx[j][get_nnz_rank[j] == comm.rank]
+            if not inds_rank_to_j.any():
+                continue
+
+            print(f"Posting send {comm.rank}-->{j}", flush=True)
+
+            gg_sendbuf[j] = get_host(
+                GG.data[..., inds_rank_to_j - GG.nnz_section_offsets[comm.rank]]
+            )
+            if np.isnan(gg_sendbuf[j]).any():
+                raise ValueError(f"rank {comm.rank}: gg send buffer contains NaNs")
+
+            comm.Isend(gg_sendbuf[j], dest=j, tag=0)
+
+        Request.Waitall(reqs_gg)
+
         reqs_gl = []
         for i in range(comm.size):
             if i == comm.rank:
@@ -217,65 +277,48 @@ class BSESolverDist:
             if not mask_buffer.any():
                 continue
 
-            gg_buffer[i] = np.zeros(
-                (G_nen, int(mask_buffer.sum())), dtype=np.complex128
-            )
-            gl_buffer[i] = np.zeros(
+            gl_recbuf[i] = np.zeros(
                 (G_nen, int(mask_buffer.sum())), dtype=np.complex128
             )
 
             print(f"Posting receive {i}-->{comm.rank}", flush=True)
 
-            req = comm.Irecv(gg_buffer[i], source=i, tag=0)
-            reqs_gg.append(req)
-            req = comm.Irecv(gl_buffer[i], source=i, tag=0)
-            reqs_gl.append(req)
+            reqs_gl.append(comm.Irecv(gl_recbuf[i], source=i, tag=1))
 
-        # Send in reverse order to avoid deadlock (?)
         for j in reversed(range(comm.size)):
             if j == comm.rank:
                 continue
-            inds_j_needs_from_rank = get_nnz_idx[j][get_nnz_rank[j] == comm.rank]
-            if not inds_j_needs_from_rank.any():
+            inds_rank_to_j = get_nnz_idx[j][get_nnz_rank[j] == comm.rank]
+            if not inds_rank_to_j.any():
                 continue
-            print(f"Posting send {comm.rank}-->{j}", flush=True)
-            comm.Isend(
-                get_host(
-                    GG.data[
-                        ..., inds_j_needs_from_rank - GG.nnz_section_offsets[comm.rank]
-                    ]
-                ),
-                dest=j,
-                tag=0,
-            )
-            comm.Isend(
-                get_host(
-                    GL.data[
-                        ..., inds_j_needs_from_rank - GL.nnz_section_offsets[comm.rank]
-                    ]
-                ),
-                dest=j,
-                tag=0,
-            )
 
-        try:
-            Request.Waitall(reqs_gg)
-        except Exception:
-            status = MPI.Status()
-            print("gg error:", status.error, flush=True)
-        try:
-            Request.Waitall(reqs_gl)
-        except Exception:
-            status = MPI.Status()
-            print("gl error:", status.error, flush=True)
+            print(f"Posting send {comm.rank}-->{j}", flush=True)
+
+            gl_sendbuf[j] = get_host(
+                GL.data[..., inds_rank_to_j - GL.nnz_section_offsets[comm.rank]]
+            )
+            if np.isnan(gl_sendbuf[j]).any():
+                raise ValueError(f"rank {comm.rank}: gl send buffer contains NaNs")
+
+            comm.Isend(gl_sendbuf[j], dest=j, tag=1)
+
+        Request.Waitall(reqs_gl)
+
+        if xp.isnan(GG.data).any():
+            raise ValueError(f"rank {comm.rank}: GG contains NaNs")
 
         if comm.size > 1:
-            gg_buffer = xp.concatenate(
-                [xp.array(gg) for gg in gg_buffer if gg is not None], axis=-1
+            gg_recbuf = xp.concatenate(
+                [xp.array(gg) for gg in gg_recbuf if gg is not None], axis=-1
             )
-            gl_buffer = xp.concatenate(
-                [xp.array(gl) for gl in gl_buffer if gl is not None], axis=-1
+            gl_recbuf = xp.concatenate(
+                [xp.array(gl) for gl in gl_recbuf if gl is not None], axis=-1
             )
+
+            if xp.isnan(gl_recbuf).any():
+                raise ValueError(f"rank {comm.rank}: gl buffer contains NaNs")
+            if xp.isnan(gg_recbuf).any():
+                raise ValueError(f"rank {comm.rank}: gg buffer contains NaNs")
 
         finish_time = time.time()
         print(
@@ -299,47 +342,46 @@ class BSESolverDist:
             l = self.table_dist[1, col]
 
             ind_ik = xp.where((GG.rows == i) & (GG.cols == k))[0]
-            # could happen that G_{ik} is zero, so ind_ik becomes empty list
-            # print(ind_ik)
-            if len(ind_ik) > 0:
-                rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
-                if comm.rank == rank_ik:
-                    gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
-                    gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
-                else:
-                    ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
-                    gg_ik = gg_buffer[..., ind[0]]
-                    gl_ik = gl_buffer[..., ind[0]]
+
+            rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
+            if comm.rank == rank_ik:
+                gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
+                gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
+            else:
+                ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
+                # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
+                # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
+                # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
+                # print(f"rank {comm.rank}:", ind_ik, flush=True)
+                gg_ik = gg_recbuf[..., ind[0]]
+                gl_ik = gl_recbuf[..., ind[0]]
 
             ind_lj = xp.where((GL.rows == l) & (GL.cols == j))[0]
             # print(ind_lj)
             # could happen that the G_{lj} is zero so not found in G
-            if len(ind_lj) > 0:
-                rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
-                if comm.rank == rank_lj:
-                    gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
-                    gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
-                else:
-                    ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
-                    gg_lj = gg_buffer[..., ind[0]]
-                    gl_lj = gl_buffer[..., ind[0]]
-            if (len(ind_ik) > 0) and (len(ind_lj) > 0):
-                L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
-                self.L0mat_dist[row, col] = L_ijkl[
-                    G_nen : G_nen + self.num_E * step_E : step_E
-                ]
+            rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
+            if comm.rank == rank_lj:
+                gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
+                gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
             else:
-                self.L0mat_dist[row, col] = xp.array(
-                    [0] * self.num_E, dtype=xp.complex128
-                )
+                ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
+                # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
+                # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
+                # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
+                # print(f"rank {comm.rank}:", ind_lj, flush=True)
+                gg_lj = gg_recbuf[..., ind[0]]
+                gl_lj = gl_recbuf[..., ind[0]]
+
+            L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
+            self.L0mat_dist[row, col] = L_ijkl[
+                G_nen : G_nen + self.num_E * step_E : step_E
+            ]
 
         finish_time = time.time()
         print(
             " rank ", comm.rank, "compute time=", finish_time - start_time, flush=True
         )
         start_time = finish_time
-
-        comm.barrier()
 
         finish_time = time.time()
         print(
@@ -359,29 +401,57 @@ class BSESolverDist:
             print(" dtranspose time=", finish_time - start_time, flush=True)
         start_time = finish_time
 
+        # if comm.rank == 0:
+        #     np.save("L0_rows.npy", self.L0mat_dist.rows)
+        #     np.save("L0_cols.npy", self.L0mat_dist.cols)
+        #     np.save("L0_data.npy", self.L0mat_dist.data[0])
+
+        #     np.save("bta_rows.npy", self.rows)
+        #     np.save("bta_cols.npy", self.cols)
+
+        #     np.save("table.npy", self.table)
+        #     np.save("inverse_table.npy", self.inverse_table)
+        #     np.save("table_dist.npy", self.table_dist)
+        #     np.save("inverse_table_dist.npy", self.inverse_table_dist)
+
+        # return
+
         # reorder L0mat to BTA shape
         # !!! an additional L0mat gets allocated temporarily !!!
-        ARRAY_SHAPE = (self.totalsize, self.totalsize)
-        BLOCK_SIZES = np.concatenate(
-            [[self.tipsize], self.blocksize * np.ones(self.num_blocks, dtype=int)]
-        )
+
+        BLOCK_SIZES = [self.tipsize] + [self.blocksize] * self.num_blocks
         GLOBAL_STACK_SHAPE = (self.num_E,)
-        data = np.zeros(len(self.rows), dtype=xp.complex128)
-        coords = (self.rows, self.cols)
-        coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
-        self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
+        # data = np.zeros(len(self.rows), dtype=xp.complex128)
+        # coords = (self.rows, self.cols)
+        # coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
+        # self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
+
+        perm_rows = self.inverse_table[*self.table_dist[:, self.L0mat_dist.rows]]
+        perm_cols = self.inverse_table[*self.table_dist[:, self.L0mat_dist.cols]]
+
+        permutation = BSESolverDist._compute_permutation(
+            get_host(perm_rows), get_host(perm_cols), self.rows, self.cols
+        )
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "compute permutation time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
+        self.L0mat = DSBCOO(
+            data=self.L0mat_dist.data[..., permutation],
+            rows=get_device(self.rows),
+            cols=get_device(self.cols),
+            block_sizes=BLOCK_SIZES,
+            global_stack_shape=GLOBAL_STACK_SHAPE,
+        )
         del self.rows
         del self.cols
-
-        for inz in range(self.nnz):
-            row = self.L0mat.rows[inz]
-            col = self.L0mat.cols[inz]
-            i, j = self.table[:, row]
-            k, l = self.table[:, col]
-            row_dist = self.inverse_table_dist[i, j]
-            col_dist = self.inverse_table_dist[k, l]
-            self.L0mat.data[..., inz] = self.L0mat_dist[row_dist, col_dist]
-
         del self.L0mat_dist
 
         finish_time = time.time()

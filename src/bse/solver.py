@@ -3,8 +3,7 @@ import numpy as np
 from cupyx.scipy import sparse as cusparse
 from mpi4py.MPI import COMM_WORLD as comm
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import get_host, xp
-from scipy import sparse
+from qttools.utils.gpu_utils import get_device, get_host, xp
 from serinv.algs import ddbtasinv
 
 
@@ -141,16 +140,17 @@ class BSESolver:
         return
 
     def _alloc_twobody_matrix(self, num_E: int):
-        ARRAY_SHAPE = (self.totalsize, self.totalsize)
-        BLOCK_SIZES = np.concatenate(
-            [[self.tipsize], self.blocksize * np.ones(self.num_blocks, dtype=int)]
-        )
+        BLOCK_SIZES = [self.tipsize] + [self.blocksize] * self.num_blocks
         GLOBAL_STACK_SHAPE = (num_E,)
         self.num_E = num_E
-        data = np.zeros(len(self.rows), dtype=xp.complex128)
-        coords = (self.rows, self.cols)
-        coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
-        self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
+        data = xp.zeros(len(self.rows), dtype=xp.complex128)
+        self.L0mat = DSBCOO(
+            data=data,
+            rows=get_device(self.rows),
+            cols=get_device(self.cols),
+            block_sizes=BLOCK_SIZES,
+            global_stack_shape=GLOBAL_STACK_SHAPE,
+        )
         del self.rows
         del self.cols
         if self.L0mat.distribution_state == "stack":
