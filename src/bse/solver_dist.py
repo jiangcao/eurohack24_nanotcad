@@ -273,7 +273,9 @@ class BSESolverDist:
 
         synchronize_current_stream()
 
-        offsets = [-2, -1, 1, 2]  # list of overlapping neighboring ranks
+        offsets = [
+            i for i in range(-comm.size, comm.size) if i != 0
+        ]  # [-2, -1, 1, 2]  # list of overlapping neighboring ranks
 
         for offset in offsets:
             # receive from comm.rank - offset
@@ -330,8 +332,9 @@ class BSESolverDist:
 
                     comm.Isend(gg_sendbuf[0], dest=j, tag=0)
                     comm.Isend(gl_sendbuf[0], dest=j, tag=1)
+
             # non-local part
-            if (i > -1) and (i < comm.size):
+            if (i > -1) and (i < comm.size) and (mask_buffer.any()):
                 # wait for some data comes in
                 recbuf_idx = get_nnz_idx[comm.rank][get_nnz_rank[comm.rank] == i]
                 Request.Waitall([reqs_gg, reqs_gl])
