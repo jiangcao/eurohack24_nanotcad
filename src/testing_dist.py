@@ -3,12 +3,12 @@ import time
 import numpy as np
 from mpi4py.MPI import COMM_WORLD as comm
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import xp
+from qttools.utils.gpu_utils import xp, get_host
 from scipy import sparse
 
 from bse import BSESolver, BSESolverDist
 
-datasetname = "/usr/scratch2/tortin16/jiacao/BSE_calc/agnr7/python/test/data_len10_ndiag14_nen600_"
+datasetname = "/capstor/scratch/cscs/hck26/data_len10_ndiag14_nen600_"
 indata = np.load(datasetname + "input.npz")
 outdata = np.load(datasetname + "output.npz")
 
@@ -35,7 +35,7 @@ def get_data(size) -> np.ndarray:
 
 # Prepare data.
 ndiag = 4
-nm_dev = int(indata["nm_dev"])
+nm_dev = 50 # int(indata["nm_dev"])
 
 if comm.rank == 0:
     GL = np.array(
@@ -72,10 +72,10 @@ if np.isnan(GL).any() or np.isnan(GG).any():
 
 block_sizes = [7] * 20
 g_lesser = DSBCOO.from_sparray(
-    sparse.coo_array(GL[..., 100].get()), block_sizes, (600,)
+    sparse.coo_array(get_host(GL[..., 100])), block_sizes, (600,)
 )
 g_greater = DSBCOO.from_sparray(
-    sparse.coo_array(GG[..., 100].get()), block_sizes, (600,)
+    sparse.coo_array(get_host(GG[..., 100])), block_sizes, (600,)
 )
 if np.isnan(g_lesser.data).any() or np.isnan(g_greater.data).any():
     raise ValueError("NaNs in data.")
@@ -100,7 +100,7 @@ start_time = time.time()
 
 bse_dist = BSESolverDist(nm_dev, ndiag)
 
-bse_dist._preprocess()
+bse_dist._preprocess(g_greater.rows, g_greater.cols)
 bse._preprocess()
 
 num_E = 10
@@ -147,14 +147,14 @@ print(
     / np.linalg.norm(bse_dist.L0mat.data),
 )
 
-if comm.rank == comm.size - 1:
-    print("save data ...", flush=True)
-    np.save("dev/L0mat_dist_data.npy", bse_dist.L0mat.data[-1])
-    np.save("dev/L0mat_dist_rows.npy", bse_dist.L0mat.rows)
-    np.save("dev/L0mat_dist_cols.npy", bse_dist.L0mat.cols)
-    np.save("dev/L0mat_data.npy", bse.L0mat.data[-1])
-    np.save("dev/L0mat_rows.npy", bse.L0mat.rows)
-    np.save("dev/L0mat_cols.npy", bse.L0mat.cols)
+# if comm.rank == comm.size - 1:
+#     print("save data ...", flush=True)
+#     np.save("dev/L0mat_dist_data.npy", bse_dist.L0mat.data[-1])
+#     np.save("dev/L0mat_dist_rows.npy", bse_dist.L0mat.rows)
+#     np.save("dev/L0mat_dist_cols.npy", bse_dist.L0mat.cols)
+#     np.save("dev/L0mat_data.npy", bse.L0mat.data[-1])
+#     np.save("dev/L0mat_rows.npy", bse.L0mat.rows)
+#     np.save("dev/L0mat_cols.npy", bse.L0mat.cols)
 
 
 comm.barrier()
@@ -173,22 +173,22 @@ comm.barrier()
 if comm.rank == 0:
     finish_time = time.time()
     print(" compute time = ", finish_time - start_time)
-    start_time = finish_time
+#     start_time = finish_time
 
-    print("dense solve ...", flush=True)
+#     print("dense solve ...", flush=True)
 
-P2, Gamma2 = bse_dist._densesolve_interacting_twobody(V, W)
+# P2, Gamma2 = bse_dist._densesolve_interacting_twobody(V, W)
 
-comm.barrier()
+# comm.barrier()
 
-if comm.rank == 0:
-    finish_time = time.time()
-    print(" compute time = ", finish_time - start_time)
-    start_time = finish_time
+# if comm.rank == 0:
+#     finish_time = time.time()
+#     print(" compute time = ", finish_time - start_time)
+#     start_time = finish_time
 
-print(
-    "rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2))
-), "abs error=", np.sum(np.abs(P2 - P))
+# print(
+#     "rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2))
+# ), "abs error=", np.sum(np.abs(P2 - P))
 
 # filename = datasetname + "output"
 # np.savez(filename + "_rank" + str(comm.rank), P=get_host(P))

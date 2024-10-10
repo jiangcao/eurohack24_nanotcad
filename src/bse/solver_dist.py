@@ -6,9 +6,16 @@ from cupyx.scipy import sparse as cusparse
 from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.MPI import Request
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import get_device, get_host, xp
+from qttools.utils.gpu_utils import get_device, get_host, xp, synchronize_current_stream
+from qttools.utils.mpi_utils import check_gpu_aware_mpi
+from scipy import fft as spfft
+from cupyx.scipy.fftpack import fftn, ifftn
+
 from scipy import sparse
 from serinv.algs import ddbtasinv
+from cupyx.profiler import time_range
+
+GPU_AWARE = check_gpu_aware_mpi()
 
 
 class BSESolverDist:
@@ -16,6 +23,7 @@ class BSESolverDist:
         self.num_sites = num_sites
         self.cutoff = cutoff
 
+    @time_range()
     @nb.njit(parallel=True, fastmath=True)
     def _get_sparsity(size: np.int32, cutoff: np.int32, table: np.ndarray):
         nnz = 0
@@ -36,6 +44,7 @@ class BSESolverDist:
 
         return nnz, coords
 
+    @time_range()
     @nb.njit(parallel=True, fastmath=True)
     def _compute_permutation(
         perm_rows: np.ndarray, perm_cols: np.ndarray, rows: np.ndarray, cols: np.ndarray
@@ -47,6 +56,29 @@ class BSESolverDist:
 
         return permutation
 
+    @time_range()
+    @nb.njit(parallel=True, fastmath=True)
+    def _get_mapping(
+        row: np.ndarray,
+        col: np.ndarray,
+        L_rows: np.ndarray,
+        L_cols: np.ndarray,
+        my_rank: int,
+        L_nnz_section_offsets: np.ndarray,
+    ):
+        L_idx = np.zeros((row.shape[0], row.shape[1]), nb.int32) - 1
+        for i in nb.prange(row.shape[0]):
+            for j in nb.prange(row.shape[1]):
+                ind = np.where((L_rows == row[i, j]) & (L_cols == col[i, j]))[0]
+                if ind.size == 0:
+                    continue
+                data_rank = np.where(L_nnz_section_offsets <= ind[0])[0][-1]
+                if my_rank != data_rank:
+                    continue
+                L_idx[i, j] = ind[0] - L_nnz_section_offsets[data_rank]
+
+        return L_idx
+
     # Figure out the info to locate the needed nonzero elements (nnz) whichin an interaction range of `ndiag` of
     # the nnz on the i-th rank.
     #   - get_nnz_size: number of the nnz to gether
@@ -55,6 +87,7 @@ class BSESolverDist:
     # For example, this gives all the nnz indices needed by i-th rank, which locates on the j-th rank
     #   > mask_i_needs_from_j = np.where(get_nnz_rank[i] == j)[0]
     #   > nnz_i_needs_from_j = get_nnz_idx[i][mask_i_needs_from_j]
+    @time_range()
     @staticmethod
     def _determine_rank_map(offset, ndiag: int, rows: xp.ndarray, cols: xp.ndarray):
         """
@@ -89,7 +122,8 @@ class BSESolverDist:
 
         return get_nnz_size, get_nnz_idx, get_nnz_rank
 
-    def _preprocess(self):
+    @time_range()
+    def _preprocess(self, rows, cols):
         """Computes some the sparsity pattern and the block-size."""
         # Sets self.size, self.table, self.inverse_table, self.nnz, self.rows, self.cols
         self._preprocess_bta()
@@ -98,14 +132,21 @@ class BSESolverDist:
             xp.zeros((self.num_sites, self.num_sites), dtype=xp.int32) * xp.nan
         )
         offset = 0
-        for i in range(self.num_sites):
-            l = max(0, i - self.cutoff)
-            k = min(self.num_sites - 1, i + self.cutoff)
-            for j in range(l, k + 1):
-                self.table_dist[0, offset] = i
-                self.table_dist[1, offset] = j
-                self.inverse_table_dist[i, j] = offset
-                offset += 1
+        for row, col in zip(rows, cols):
+            self.table_dist[0, offset] = row
+            self.table_dist[1, offset] = col
+            self.inverse_table_dist[row, col] = offset
+            offset += 1
+
+        # for i in range(self.num_sites):
+        #     l = max(0, i - self.cutoff)
+        #     k = min(self.num_sites - 1, i + self.cutoff)
+        #     for j in range(l, k + 1):
+        #         self.table_dist[0, offset] = i
+        #         self.table_dist[1, offset] = j
+        #         self.inverse_table_dist[i, j] = offset
+        #         offset += 1
+
         assert offset == self.size
         nnz, coords_dist = BSESolverDist._get_sparsity(
             self.size, self.cutoff, get_host(self.table_dist)
@@ -115,6 +156,7 @@ class BSESolverDist:
 
     # preprocessing the sparsity pattern and decide the block_size and
     # num_blocks in the BTA matrix
+    @time_range()
     def _preprocess_bta(self):
         """Computes some the sparsity pattern and the block-size."""
         self.size = self.num_sites**2 - (self.num_sites - self.cutoff - 1) * (
@@ -178,6 +220,7 @@ class BSESolverDist:
             )
         return
 
+    @time_range()
     def _alloc_twobody_matrix(self, num_E: int):
         ARRAY_SHAPE = (self.size, self.size)
         BLOCK_SIZES = [self.size] * 1
@@ -193,6 +236,7 @@ class BSESolverDist:
             self.L0mat_dist.dtranspose()
         return
 
+    @time_range()
     def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int = 1):
         start_time = time.time()
         if self.L0mat_dist.distribution_state == "stack":
@@ -220,6 +264,7 @@ class BSESolverDist:
         gg_sendbuf = [None] * comm.size
         gl_sendbuf = [None] * comm.size
 
+        synchronize_current_stream()
         for j in reversed(range(comm.size)):
             if j == comm.rank:
                 continue
@@ -227,12 +272,20 @@ class BSESolverDist:
             if not inds_rank_to_j.any():
                 continue
 
-            gg_sendbuf[j] = np.zeros(
-                (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
-            )
-            gl_sendbuf[j] = np.zeros(
-                (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
-            )
+            if not GPU_AWARE:
+                gg_sendbuf[j] = np.zeros(
+                    (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                )
+                gl_sendbuf[j] = np.zeros(
+                    (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                )
+            else:
+                gg_sendbuf[j] = xp.zeros(
+                    (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                )
+                gl_sendbuf[j] = xp.zeros(
+                    (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                )
 
         reqs_gg = []
         for i in range(comm.size):
@@ -242,9 +295,14 @@ class BSESolverDist:
             if not mask_buffer.any():
                 continue
 
-            gg_recbuf[i] = np.zeros(
-                (G_nen, int(mask_buffer.sum())), dtype=np.complex128
-            )
+            if not GPU_AWARE:
+                gg_recbuf[i] = np.zeros(
+                    (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                )
+            else:
+                gg_recbuf[i] = xp.zeros(
+                    (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                )
 
             print(f"Posting receive {i}-->{comm.rank}", flush=True)
 
@@ -259,12 +317,13 @@ class BSESolverDist:
 
             print(f"Posting send {comm.rank}-->{j}", flush=True)
 
-            gg_sendbuf[j] = get_host(
-                GG.data[..., inds_rank_to_j - GG.nnz_section_offsets[comm.rank]]
-            )
-            if np.isnan(gg_sendbuf[j]).any():
-                raise ValueError(f"rank {comm.rank}: gg send buffer contains NaNs")
-
+            gg_sendbuf[j] = GG.data[
+                ..., inds_rank_to_j - GG.nnz_section_offsets[comm.rank]
+            ]
+            if not GPU_AWARE:
+                gg_sendbuf[j] = get_host(gg_sendbuf[j])
+            # if np.isnan(gg_sendbuf[j]).any():
+            #     raise ValueError(f"rank {comm.rank}: gg send buffer contains NaNs")
             comm.Isend(gg_sendbuf[j], dest=j, tag=0)
 
         Request.Waitall(reqs_gg)
@@ -277,9 +336,14 @@ class BSESolverDist:
             if not mask_buffer.any():
                 continue
 
-            gl_recbuf[i] = np.zeros(
-                (G_nen, int(mask_buffer.sum())), dtype=np.complex128
-            )
+            if not GPU_AWARE:
+                gl_recbuf[i] = np.zeros(
+                    (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                )
+            else:
+                gl_recbuf[i] = xp.zeros(
+                    (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                )
 
             print(f"Posting receive {i}-->{comm.rank}", flush=True)
 
@@ -294,12 +358,15 @@ class BSESolverDist:
 
             print(f"Posting send {comm.rank}-->{j}", flush=True)
 
-            gl_sendbuf[j] = get_host(
-                GL.data[..., inds_rank_to_j - GL.nnz_section_offsets[comm.rank]]
-            )
-            if np.isnan(gl_sendbuf[j]).any():
-                raise ValueError(f"rank {comm.rank}: gl send buffer contains NaNs")
+            gl_sendbuf[j] = GL.data[
+                ..., inds_rank_to_j - GL.nnz_section_offsets[comm.rank]
+            ]
 
+            if not GPU_AWARE:
+                gl_sendbuf[j] = get_host(gl_sendbuf[j])
+
+            # if np.isnan(gl_sendbuf[j]).any():
+            #     raise ValueError(f"rank {comm.rank}: gl send buffer contains NaNs")
             comm.Isend(gl_sendbuf[j], dest=j, tag=1)
 
         Request.Waitall(reqs_gl)
@@ -330,52 +397,193 @@ class BSESolverDist:
         )
         start_time = finish_time
 
-        start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
-        end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
-        for inz in range(start_inz, end_inz):
-            row = self.L0mat_dist.rows[inz]
-            col = self.L0mat_dist.cols[inz]
+        local_elements = kron_correlate(GG.data, GL.data) - kron_correlate(
+            GL.data, GG.data
+        )
 
-            i = self.table_dist[0, row]
-            j = self.table_dist[1, row]
-            k = self.table_dist[0, col]
-            l = self.table_dist[1, col]
+        start_inz_g = int(GG.nnz_section_offsets[comm.rank])
+        end_inz_g = int(GG.nnz_section_offsets[comm.rank + 1])
+        # start_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
+        # end_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
 
-            ind_ik = xp.where((GG.rows == i) & (GG.cols == k))[0]
+        inz = np.arange(start_inz_g, end_inz_g)
+        row = self.inverse_table_dist[GG.rows[inz[:, None]], GG.cols[inz[:]]]
+        col = self.inverse_table_dist[GG.cols[inz[:, None]], GG.rows[inz[:]]]
 
-            rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
-            if comm.rank == rank_ik:
-                gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
-                gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
-            else:
-                ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
-                # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-                # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-                # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
-                # print(f"rank {comm.rank}:", ind_ik, flush=True)
-                gg_ik = gg_recbuf[..., ind[0]]
-                gl_ik = gl_recbuf[..., ind[0]]
+        inds = BSESolverDist._get_mapping(
+            get_host(row),
+            get_host(col),
+            get_host(self.L0mat_dist.rows),
+            get_host(self.L0mat_dist.cols),
+            comm.rank,
+            get_host(self.L0mat_dist.nnz_section_offsets),
+        )
 
-            ind_lj = xp.where((GL.rows == l) & (GL.cols == j))[0]
-            # print(ind_lj)
-            # could happen that the G_{lj} is zero so not found in G
-            rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
-            if comm.rank == rank_lj:
-                gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
-                gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
-            else:
-                ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
-                # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-                # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-                # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
-                # print(f"rank {comm.rank}:", ind_lj, flush=True)
-                gg_lj = gg_recbuf[..., ind[0]]
-                gl_lj = gl_recbuf[..., ind[0]]
+        inds = get_device(inds)
+        # if comm.rank == 0:
+        #     np.save("inds.npy", inds)
+        valid = xp.where(inds != -1)
+        print(f"rank {comm.rank}: valid inds = {valid}", flush=True)
+        print(f"rank {comm.rank}: valid inds = {valid[0].shape}", flush=True)
+        print(f"rank {comm.rank}: valid inds = {inds[valid]}", flush=True)
+        self.L0mat_dist.data[..., inds[valid]] = local_elements[..., valid]
 
-            L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
-            self.L0mat_dist[row, col] = L_ijkl[
-                G_nen : G_nen + self.num_E * step_E : step_E
-            ]
+        # with time_range("local elements", color_id=comm.rank):
+        #     for gg_inz in range(start_inz_g, end_inz_g):
+        #         i = GG.rows[gg_inz]
+        #         k = GG.cols[gg_inz]
+        #         for gl_inz in range(start_inz_g, end_inz_g):
+        #             l = GL.rows[gl_inz]
+        #             j = GL.cols[gl_inz]
+
+        #             row = self.inverse_table_dist[i, j]
+        #             col = self.inverse_table_dist[k, l]
+
+        #             if np.isnan(row) or np.isnan(col):
+        #                 continue
+        #             try:
+        #                 self.L0mat_dist[row, col] = local_elements[
+        #                     G_nen : G_nen + self.num_E * step_E : step_E,
+        #                     gg_inz - start_inz_g,
+        #                     gl_inz - start_inz_g,
+        #                 ]
+        #             except IndexError as e:
+        #                 print(e)
+        #                 continue
+
+        if comm.size > 1:
+            local_elements = kron_correlate(GG.data, gl_recbuf) - kron_correlate(
+                GL.data, gg_recbuf
+            )
+
+            with time_range("recv elements", color_id=comm.rank):
+                for gg_inz in range(start_inz_g, end_inz_g):
+                    i = GG.rows[gg_inz]
+                    k = GG.cols[gg_inz]
+                    for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+                        l = GL.rows[idx]
+                        j = GL.cols[idx]
+
+                        row = self.inverse_table_dist[i, j]
+                        col = self.inverse_table_dist[k, l]
+
+                        if np.isnan(row) or np.isnan(col):
+                            continue
+
+                        try:
+                            self.L0mat_dist[row, col] = local_elements[
+                                G_nen : G_nen + self.num_E * step_E : step_E,
+                                gg_inz - start_inz_g,
+                                iidx,
+                            ]
+                        except IndexError as e:
+                            print(e)
+                            continue
+
+            local_elements = kron_correlate(gg_recbuf, GL.data) - kron_correlate(
+                gl_recbuf, GG.data
+            )
+
+            with time_range("recv elements ", color_id=comm.rank):
+                for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+                    i = GL.rows[idx]
+                    k = GL.cols[idx]
+                    for gg_inz in range(start_inz_g, end_inz_g):
+                        l = GG.rows[gg_inz]
+                        j = GG.cols[gg_inz]
+
+                        row = self.inverse_table_dist[i, j]
+                        col = self.inverse_table_dist[k, l]
+
+                        if np.isnan(row) or np.isnan(col):
+                            continue
+
+                        try:
+                            self.L0mat_dist[row, col] = local_elements[
+                                G_nen : G_nen + self.num_E * step_E : step_E,
+                                iidx,
+                                gg_inz - start_inz_g,
+                            ]
+                        except IndexError as e:
+                            print(e)
+                            continue
+
+            local_elements = kron_correlate(gg_recbuf, gl_recbuf) - kron_correlate(
+                gl_recbuf, gg_recbuf
+            )
+
+            with time_range("recv elements ", color_id=comm.rank):
+                for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+                    i = GL.rows[idx]
+                    k = GL.cols[idx]
+                    for i2idx, idx_v2 in enumerate(get_nnz_idx[comm.rank]):
+                        l = GG.rows[idx_v2]
+                        j = GG.cols[idx_v2]
+
+                        row = self.inverse_table_dist[i, j]
+                        col = self.inverse_table_dist[k, l]
+
+                        if np.isnan(row) or np.isnan(col):
+                            continue
+
+                        try:
+                            self.L0mat_dist[row, col] = local_elements[
+                                G_nen : G_nen + self.num_E * step_E : step_E,
+                                iidx,
+                                i2idx,
+                            ]
+                        except IndexError as e:
+                            print(e)
+                            continue
+
+        # start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
+        # end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
+        # for inz in range(start_inz, end_inz):
+        #     with time_range("access elements", color_id=comm.rank):
+        #         row = self.L0mat_dist.rows[inz]
+        #         col = self.L0mat_dist.cols[inz]
+
+        #         i = self.table_dist[0, row]
+        #         j = self.table_dist[1, row]
+        #         k = self.table_dist[0, col]
+        #         l = self.table_dist[1, col]
+
+        #         ind_ik = xp.where((GG.rows == i) & (GG.cols == k))[0]
+
+        #         rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
+        #         if comm.rank == rank_ik:
+        #             gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
+        #             gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
+        #         else:
+        #             ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
+        #             # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
+        #             # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
+        #             # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
+        #             # print(f"rank {comm.rank}:", ind_ik, flush=True)
+        #             gg_ik = gg_recbuf[..., ind[0]]
+        #             gl_ik = gl_recbuf[..., ind[0]]
+
+        #         ind_lj = xp.where((GL.rows == l) & (GL.cols == j))[0]
+        #         # print(ind_lj)
+        #         # could happen that the G_{lj} is zero so not found in G
+        #         rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
+        #         if comm.rank == rank_lj:
+        #             gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
+        #             gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
+        #         else:
+        #             ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
+        #             # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
+        #             # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
+        #             # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
+        #             # print(f"rank {comm.rank}:", ind_lj, flush=True)
+        #             gg_lj = gg_recbuf[..., ind[0]]
+        #             gl_lj = gl_recbuf[..., ind[0]]
+
+        # with time_range("compute L0", color_id=comm.rank):
+        #     L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
+        #     self.L0mat_dist[row, col] = L_ijkl[
+        #         G_nen : G_nen + self.num_E * step_E : step_E
+        #     ]
 
         finish_time = time.time()
         print(
@@ -466,6 +674,7 @@ class BSESolverDist:
 
         return
 
+    @time_range()
     def _calc_kernel(self, V: xp.array, W: xp.array):
 
         kernel_tip = xp.zeros((self.tipsize, self.tipsize), dtype=xp.complex128)
@@ -487,6 +696,7 @@ class BSESolverDist:
         kernel_tip *= 1j
         return kernel_tip, kernel_diag
 
+    @time_range()
     def _densesolve_interacting_twobody(self, V: xp.array, W: xp.array):
         if self.L0mat.distribution_state != "stack":
             self.L0mat.dtranspose()
@@ -505,37 +715,39 @@ class BSESolverDist:
         )
 
         table = self.table
+        with time_range("dense solve", color_id=comm.rank):
+            for ie in range(local_nen):
+                print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
+                data = self.L0mat.data[ie]
+                coords = (self.L0mat.rows, self.L0mat.cols)
+                L0 = cusparse.coo_matrix(
+                    (data, coords), shape=(self.size, self.size)
+                ).todense()
 
-        for ie in range(local_nen):
-            print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
-            data = self.L0mat.data[ie]
-            coords = (self.L0mat.rows, self.L0mat.cols)
-            L0 = cusparse.coo_matrix(
-                (data, coords), shape=(self.size, self.size)
-            ).todense()
+                A = -L0 @ K + xp.diag(xp.ones(self.size, dtype=xp.complex128))
+                invA = xp.linalg.inv(A)
+                # impose sparsity pattern of BTA, for a proper comparison with selected inversion
+                invA_bta = _impose_bta_sparsity(
+                    invA, self.blocksize, self.tipsize, self.num_blocks
+                )
+                A = invA_bta @ L0
 
-            A = -L0 @ K + xp.diag(xp.ones(self.size, dtype=xp.complex128))
-            invA = xp.linalg.inv(A)
-            # impose sparsity pattern of BTA, for a proper comparison with selected inversion
-            invA_bta = _impose_bta_sparsity(
-                invA, self.blocksize, self.tipsize, self.num_blocks
-            )
-            A = invA_bta @ L0
+                for row in range(self.tipsize):
+                    for col in range(self.tipsize):
+                        i = table[0, row]
+                        j = table[0, col]
+                        P[i, j, ie] = -1j * A[row, col]
 
-            for row in range(self.tipsize):
-                for col in range(self.tipsize):
+                for row in range(self.tipsize):
                     i = table[0, row]
-                    j = table[0, col]
-                    P[i, j, ie] = -1j * A[row, col]
+                    for col in range(self.tipsize, self.size):
+                        j = table[0, col]
+                        k = table[1, col]
+                        Gamma[i, j, k, ie] = A[row, col]
 
-            for row in range(self.tipsize):
-                i = table[0, row]
-                for col in range(self.tipsize, self.size):
-                    j = table[0, col]
-                    k = table[1, col]
-                    Gamma[i, j, k, ie] = A[row, col]
         return P, Gamma
 
+    @time_range()
     def _solve_interacting_twobody(self, V: xp.array, W: xp.array):
         if self.L0mat.distribution_state != "stack":
             self.L0mat.dtranspose()
@@ -570,136 +782,147 @@ class BSESolverDist:
         )
 
         for ie in range(local_nen):
-            print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
-            # build system matrix: A = I - L0 @ K
-            # Note: SerinV takes BTA pointing down, so the block ordering should be reversed and
-            #       each block matrix should be transposed and flipped.
-            A_arrow_tip_block = xp.transpose(
-                xp.flip(
-                    -self.L0mat.stack[ie].blocks[0, 0] @ kernel_tip
-                    + xp.eye(self.tipsize)
-                )
-            )
-
-            for k in range(self.num_blocks):
-                A_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+            with time_range("construct serinv inputs", color_id=comm.rank):
+                print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
+                # build system matrix: A = I - L0 @ K
+                # Note: SerinV takes BTA pointing down, so the block ordering should be reversed and
+                #       each block matrix should be transposed and flipped.
+                A_arrow_tip_block = xp.transpose(
                     xp.flip(
-                        -self.L0mat.stack[ie].blocks[k + 1, k + 1]
-                        @ xp.diag(
-                            kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
-                        )
-                    )
-                    + xp.eye(self.blocksize)
-                )
-
-            for k in range(self.num_blocks - 1):
-                A_upper_diagonal_blocks[-k - 1, :, :] = xp.transpose(
-                    xp.flip(
-                        -self.L0mat.stack[ie].blocks[k + 1, k + 2]
-                        @ xp.diag(
-                            kernel_diag[
-                                self.blocksize * (k + 1) : self.blocksize * (k + 2)
-                            ]
-                        )
-                    )
-                )
-                A_lower_diagonal_blocks[-k - 1, :, :] = xp.transpose(
-                    xp.flip(
-                        -self.L0mat.stack[ie].blocks[k + 2, k + 1]
-                        @ xp.diag(
-                            kernel_diag[self.blocksize * (k) : self.blocksize * (k + 1)]
-                        )
+                        -self.L0mat.stack[ie].blocks[0, 0] @ kernel_tip
+                        + xp.eye(self.tipsize)
                     )
                 )
 
-            for k in range(self.num_blocks):
-                A_arrow_bottom_blocks[-k - 1, :, :] = xp.transpose(
-                    xp.flip(-self.L0mat.stack[ie].blocks[k + 1, 0] @ kernel_tip)
-                )
-                A_arrow_right_blocks[-k - 1, :, :] = xp.transpose(
-                    xp.flip(
-                        -self.L0mat.stack[ie].blocks[0, k + 1]
-                        @ xp.diag(
-                            kernel_diag[self.blocksize * k : self.blocksize * (k + 1)]
+                for k in range(self.num_blocks):
+                    A_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                        xp.flip(
+                            -self.L0mat.stack[ie].blocks[k + 1, k + 1]
+                            @ xp.diag(
+                                kernel_diag[
+                                    self.blocksize * k : self.blocksize * (k + 1)
+                                ]
+                            )
+                        )
+                        + xp.eye(self.blocksize)
+                    )
+
+                for k in range(self.num_blocks - 1):
+                    A_upper_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                        xp.flip(
+                            -self.L0mat.stack[ie].blocks[k + 1, k + 2]
+                            @ xp.diag(
+                                kernel_diag[
+                                    self.blocksize * (k + 1) : self.blocksize * (k + 2)
+                                ]
+                            )
                         )
                     )
-                )
+                    A_lower_diagonal_blocks[-k - 1, :, :] = xp.transpose(
+                        xp.flip(
+                            -self.L0mat.stack[ie].blocks[k + 2, k + 1]
+                            @ xp.diag(
+                                kernel_diag[
+                                    self.blocksize * (k) : self.blocksize * (k + 1)
+                                ]
+                            )
+                        )
+                    )
+
+                for k in range(self.num_blocks):
+                    A_arrow_bottom_blocks[-k - 1, :, :] = xp.transpose(
+                        xp.flip(-self.L0mat.stack[ie].blocks[k + 1, 0] @ kernel_tip)
+                    )
+                    A_arrow_right_blocks[-k - 1, :, :] = xp.transpose(
+                        xp.flip(
+                            -self.L0mat.stack[ie].blocks[0, k + 1]
+                            @ xp.diag(
+                                kernel_diag[
+                                    self.blocksize * k : self.blocksize * (k + 1)
+                                ]
+                            )
+                        )
+                    )
 
             # solve system matrix
-            (
-                X_diagonal_blocks_serinv,
-                X_lower_diagonal_blocks_serinv,
-                X_upper_diagonal_blocks_serinv,
-                X_arrow_bottom_blocks_serinv,
-                X_arrow_right_blocks_serinv,
-                X_arrow_tip_block_serinv,
-            ) = ddbtasinv(
-                A_diagonal_blocks,
-                A_lower_diagonal_blocks,
-                A_upper_diagonal_blocks,
-                A_arrow_bottom_blocks,
-                A_arrow_right_blocks,
-                A_arrow_tip_block,
-            )
+            with time_range("serinv", color_id=comm.rank):
+                (
+                    X_diagonal_blocks_serinv,
+                    X_lower_diagonal_blocks_serinv,
+                    X_upper_diagonal_blocks_serinv,
+                    X_arrow_bottom_blocks_serinv,
+                    X_arrow_right_blocks_serinv,
+                    X_arrow_tip_block_serinv,
+                ) = ddbtasinv(
+                    A_diagonal_blocks,
+                    A_lower_diagonal_blocks,
+                    A_upper_diagonal_blocks,
+                    A_arrow_bottom_blocks,
+                    A_arrow_right_blocks,
+                    A_arrow_tip_block,
+                )
 
             # first, we need to transpose and flip back the BTA matrix output from SerinV
             # extract P from tip of solution matrix L =  A^{-1} @ L0, and P := -i L_tip
-            tmp = (
-                -1j
-                * xp.transpose(xp.flip(X_arrow_tip_block_serinv))
-                @ self.L0mat.stack[ie].blocks[0, 0]
-            )
-            for k in range(self.num_blocks):
-                tmp += (
+            with time_range("extract P", color_id=comm.rank):
+                tmp = (
                     -1j
-                    * xp.transpose(xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]))
-                    @ self.L0mat.stack[ie].blocks[k + 1, 0]
+                    * xp.transpose(xp.flip(X_arrow_tip_block_serinv))
+                    @ self.L0mat.stack[ie].blocks[0, 0]
                 )
-            for row in range(self.tipsize):
-                for col in range(self.tipsize):
+                for k in range(self.num_blocks):
+                    tmp += (
+                        -1j
+                        * xp.transpose(
+                            xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :])
+                        )
+                        @ self.L0mat.stack[ie].blocks[k + 1, 0]
+                    )
+                for row in range(self.tipsize):
+                    for col in range(self.tipsize):
+                        i = self.table[0, row]
+                        j = self.table[0, col]
+                        P[i, j, ie] = tmp[row, col]
+                # extract Gamma from upper-arrow block of L = A^{-1} @ L0, and Gamma_ijk := L_iijk
+                # L_01 = A_00 @ L0_01 + A_01 @ L0_11
+                tmp2 = xp.zeros(
+                    (self.tipsize, self.blocksize, self.num_blocks), dtype=xp.complex128
+                )
+                for k in range(self.num_blocks):
+                    tmp2[:, :, k] += (
+                        xp.transpose(xp.flip(X_arrow_tip_block_serinv))
+                        @ self.L0mat.stack[ie].blocks[0, k + 1]
+                    )
+                    tmp2[:, :, k] += (
+                        xp.transpose(xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]))
+                        @ self.L0mat.stack[ie].blocks[k + 1, k + 1]
+                    )
+                    if k > 0:
+                        tmp2[:, :, k] += (
+                            xp.transpose(
+                                xp.flip(X_arrow_right_blocks_serinv[-(k - 1) - 1, :, :])
+                            )
+                            @ self.L0mat.stack[ie].blocks[k, k + 1]
+                        )
+                    if k < self.num_blocks - 1:
+                        tmp2[:, :, k] += (
+                            xp.transpose(
+                                xp.flip(X_arrow_right_blocks_serinv[-(k + 1) - 1, :, :])
+                            )
+                            @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
+                        )
+
+                for row in range(self.tipsize):
                     i = self.table[0, row]
-                    j = self.table[0, col]
-                    P[i, j, ie] = tmp[row, col]
-            # extract Gamma from upper-arrow block of L = A^{-1} @ L0, and Gamma_ijk := L_iijk
-            # L_01 = A_00 @ L0_01 + A_01 @ L0_11
-            tmp2 = xp.zeros(
-                (self.tipsize, self.blocksize, self.num_blocks), dtype=xp.complex128
-            )
-            for k in range(self.num_blocks):
-                tmp2[:, :, k] += (
-                    xp.transpose(xp.flip(X_arrow_tip_block_serinv))
-                    @ self.L0mat.stack[ie].blocks[0, k + 1]
-                )
-                tmp2[:, :, k] += (
-                    xp.transpose(xp.flip(X_arrow_right_blocks_serinv[-k - 1, :, :]))
-                    @ self.L0mat.stack[ie].blocks[k + 1, k + 1]
-                )
-                if k > 0:
-                    tmp2[:, :, k] += (
-                        xp.transpose(
-                            xp.flip(X_arrow_right_blocks_serinv[-(k - 1) - 1, :, :])
-                        )
-                        @ self.L0mat.stack[ie].blocks[k, k + 1]
-                    )
-                if k < self.num_blocks - 1:
-                    tmp2[:, :, k] += (
-                        xp.transpose(
-                            xp.flip(X_arrow_right_blocks_serinv[-(k + 1) - 1, :, :])
-                        )
-                        @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
-                    )
+                    for ib in range(self.num_blocks):
+                        for ic in range(self.blocksize):
+                            col = ib * self.blocksize + ic + self.tipsize
 
-            for row in range(self.tipsize):
-                i = self.table[0, row]
-                for ib in range(self.num_blocks):
-                    for ic in range(self.blocksize):
-                        col = ib * self.blocksize + ic + self.tipsize
+                            if col < self.size:
+                                j = self.table[0, col]
+                                k = self.table[1, col]
 
-                        if col < self.size:
-                            j = self.table[0, col]
-                            k = self.table[1, col]
-
-                            Gamma[i, j, k, ie] = tmp2[row, ic, ib]
+                                Gamma[i, j, k, ie] = tmp2[row, ic, ib]
         return P, Gamma
 
 
@@ -723,6 +946,19 @@ def fftconvolve(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
     a_fft = xp.fft.fft(a, n)
     b_fft = xp.fft.fft(b, n)
     return xp.fft.ifft(a_fft * b_fft)
+
+
+@time_range()
+def kron_correlate(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
+    """Convolves two 1D arrays using FFT and performs kronecker."""
+    n = a.shape[0] + b.shape[0] - 1
+    a_fft = xp.fft.fftn(a, (n,), axes=(0,))
+    b_fft = xp.fft.fftn(b[::-1], (n,), axes=(0,))
+
+    with time_range("einsum", color_id=comm.rank):
+        x_fft = xp.einsum("ei,ej->eij", a_fft, b_fft)
+
+    return xp.fft.ifftn(x_fft, axes=(0,))
 
 
 def correlate(a: xp.ndarray, b: xp.ndarray) -> xp.ndarray:
