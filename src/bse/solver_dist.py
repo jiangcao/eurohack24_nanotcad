@@ -403,10 +403,10 @@ class BSESolverDist:
 
         start_inz_g = int(GG.nnz_section_offsets[comm.rank])
         end_inz_g = int(GG.nnz_section_offsets[comm.rank + 1])
+        inz = np.arange(start_inz_g, end_inz_g)
         # start_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
         # end_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
 
-        inz = np.arange(start_inz_g, end_inz_g)
         row = self.inverse_table_dist[GG.rows[inz[:, None]], GG.cols[inz[:]]]
         col = self.inverse_table_dist[GG.cols[inz[:, None]], GG.rows[inz[:]]]
 
@@ -420,13 +420,11 @@ class BSESolverDist:
         )
 
         inds = get_device(inds)
-        # if comm.rank == 0:
-        #     np.save("inds.npy", inds)
         valid = xp.where(inds != -1)
-        print(f"rank {comm.rank}: valid inds = {valid}", flush=True)
-        print(f"rank {comm.rank}: valid inds = {valid[0].shape}", flush=True)
-        print(f"rank {comm.rank}: valid inds = {inds[valid]}", flush=True)
-        self.L0mat_dist.data[..., inds[valid]] = local_elements[..., valid]
+
+        self.L0mat_dist._data[
+            xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+        ] = local_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
         # with time_range("local elements", color_id=comm.rank):
         #     for gg_inz in range(start_inz_g, end_inz_g):
@@ -452,89 +450,146 @@ class BSESolverDist:
         #                 continue
 
         if comm.size > 1:
-            local_elements = kron_correlate(GG.data, gl_recbuf) - kron_correlate(
+            local_buf_elements = kron_correlate(GG.data, gl_recbuf) - kron_correlate(
                 GL.data, gg_recbuf
             )
 
-            with time_range("recv elements", color_id=comm.rank):
-                for gg_inz in range(start_inz_g, end_inz_g):
-                    i = GG.rows[gg_inz]
-                    k = GG.cols[gg_inz]
-                    for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-                        l = GL.rows[idx]
-                        j = GL.cols[idx]
+            row = self.inverse_table_dist[GG.rows[inz[:, None]], GG.cols[(get_nnz_idx[comm.rank])[:]]]
+            col = self.inverse_table_dist[GG.cols[inz[:, None]], GG.rows[(get_nnz_idx[comm.rank])[:]]]
 
-                        row = self.inverse_table_dist[i, j]
-                        col = self.inverse_table_dist[k, l]
+            inds = BSESolverDist._get_mapping(
+                get_host(row),
+                get_host(col),
+                get_host(self.L0mat_dist.rows),
+                get_host(self.L0mat_dist.cols),
+                comm.rank,
+                get_host(self.L0mat_dist.nnz_section_offsets),
+            )
 
-                        if np.isnan(row) or np.isnan(col):
-                            continue
+            inds = get_device(inds)
+            valid = xp.where(inds != -1)
 
-                        try:
-                            self.L0mat_dist[row, col] = local_elements[
-                                G_nen : G_nen + self.num_E * step_E : step_E,
-                                gg_inz - start_inz_g,
-                                iidx,
-                            ]
-                        except IndexError as e:
-                            print(e)
-                            continue
+            self.L0mat_dist._data[
+                xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+            ] = local_buf_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
-            local_elements = kron_correlate(gg_recbuf, GL.data) - kron_correlate(
+            # with time_range("recv elements", color_id=comm.rank):
+            #     for gg_inz in range(start_inz_g, end_inz_g):
+            #         i = GG.rows[gg_inz]
+            #         k = GG.cols[gg_inz]
+            #         for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+            #             l = GL.rows[idx]
+            #             j = GL.cols[idx]
+
+            #             row = self.inverse_table_dist[i, j]
+            #             col = self.inverse_table_dist[k, l]
+
+            #             if np.isnan(row) or np.isnan(col):
+            #                 continue
+
+            #             try:
+            #                 self.L0mat_dist[row, col] = local_buf_elements[
+            #                     G_nen : G_nen + self.num_E * step_E : step_E,
+            #                     gg_inz - start_inz_g,
+            #                     iidx,
+            #                 ]
+            #             except IndexError as e:
+            #                 print(e)
+            #                 continue
+
+
+            buf_local_elements = kron_correlate(gg_recbuf, GL.data) - kron_correlate(
                 gl_recbuf, GG.data
             )
 
-            with time_range("recv elements ", color_id=comm.rank):
-                for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-                    i = GL.rows[idx]
-                    k = GL.cols[idx]
-                    for gg_inz in range(start_inz_g, end_inz_g):
-                        l = GG.rows[gg_inz]
-                        j = GG.cols[gg_inz]
+            row = self.inverse_table_dist[GG.rows[(get_nnz_idx[comm.rank])[:, None]], GG.cols[inz[:]]]
+            col = self.inverse_table_dist[GG.cols[(get_nnz_idx[comm.rank])[:, None]], GG.rows[inz[:]]]
 
-                        row = self.inverse_table_dist[i, j]
-                        col = self.inverse_table_dist[k, l]
-
-                        if np.isnan(row) or np.isnan(col):
-                            continue
-
-                        try:
-                            self.L0mat_dist[row, col] = local_elements[
-                                G_nen : G_nen + self.num_E * step_E : step_E,
-                                iidx,
-                                gg_inz - start_inz_g,
-                            ]
-                        except IndexError as e:
-                            print(e)
-                            continue
-
-            local_elements = kron_correlate(gg_recbuf, gl_recbuf) - kron_correlate(
-                gl_recbuf, gg_recbuf
+            inds = BSESolverDist._get_mapping(
+                get_host(row),
+                get_host(col),
+                get_host(self.L0mat_dist.rows),
+                get_host(self.L0mat_dist.cols),
+                comm.rank,
+                get_host(self.L0mat_dist.nnz_section_offsets),
             )
 
-            with time_range("recv elements ", color_id=comm.rank):
-                for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-                    i = GL.rows[idx]
-                    k = GL.cols[idx]
-                    for i2idx, idx_v2 in enumerate(get_nnz_idx[comm.rank]):
-                        l = GG.rows[idx_v2]
-                        j = GG.cols[idx_v2]
+            inds = get_device(inds)
+            valid = xp.where(inds != -1)
 
-                        row = self.inverse_table_dist[i, j]
-                        col = self.inverse_table_dist[k, l]
+            self.L0mat_dist._data[
+                xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+            ] = buf_local_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
-                        if np.isnan(row) or np.isnan(col):
-                            continue
+            # with time_range("recv elements ", color_id=comm.rank):
+            #     for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+            #         i = GL.rows[idx]
+            #         k = GL.cols[idx]
+            #         for gg_inz in range(start_inz_g, end_inz_g):
+            #             l = GG.rows[gg_inz]
+            #             j = GG.cols[gg_inz]
 
-                        try:
-                            self.L0mat_dist[row, col] = local_elements[
-                                G_nen : G_nen + self.num_E * step_E : step_E,
-                                iidx,
-                                i2idx,
-                            ]
-                        except IndexError as e:
-                            print(e)
-                            continue
+            #             row = self.inverse_table_dist[i, j]
+            #             col = self.inverse_table_dist[k, l]
+
+            #             if np.isnan(row) or np.isnan(col):
+            #                 continue
+
+            #             try:
+            #                 self.L0mat_dist[row, col] = buf_local_elements[
+            #                     G_nen : G_nen + self.num_E * step_E : step_E,
+            #                     iidx,
+            #                     gg_inz - start_inz_g,
+            #                 ]
+            #             except IndexError as e:
+            #                 print(e)
+            #                 continue
+
+            buf_elements = kron_correlate(gg_recbuf, gl_recbuf) - kron_correlate(
+                gl_recbuf, gg_recbuf
+            )
+            row = self.inverse_table_dist[GG.rows[(get_nnz_idx[comm.rank])[:, None]], GG.cols[(get_nnz_idx[comm.rank])[:]]]
+            col = self.inverse_table_dist[GG.cols[(get_nnz_idx[comm.rank])[:, None]], GG.rows[(get_nnz_idx[comm.rank])[:]]]
+
+            inds = BSESolverDist._get_mapping(
+                get_host(row),
+                get_host(col),
+                get_host(self.L0mat_dist.rows),
+                get_host(self.L0mat_dist.cols),
+                comm.rank,
+                get_host(self.L0mat_dist.nnz_section_offsets),
+            )
+
+            inds = get_device(inds)
+            valid = xp.where(inds != -1)
+
+            self.L0mat_dist._data[
+                xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+            ] = buf_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
+
+            # with time_range("recv elements ", color_id=comm.rank):
+            #     for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
+            #         i = GL.rows[idx]
+            #         k = GL.cols[idx]
+            #         for i2idx, idx_v2 in enumerate(get_nnz_idx[comm.rank]):
+            #             l = GG.rows[idx_v2]
+            #             j = GG.cols[idx_v2]
+
+            #             row = self.inverse_table_dist[i, j]
+            #             col = self.inverse_table_dist[k, l]
+
+            #             if np.isnan(row) or np.isnan(col):
+            #                 continue
+
+            #             try:
+            #                 self.L0mat_dist[row, col] = buf_elements[
+            #                     G_nen : G_nen + self.num_E * step_E : step_E,
+            #                     iidx,
+            #                     i2idx,
+            #                 ]
+            #             except IndexError as e:
+            #                 print(e)
+            #                 continue
 
         # start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
         # end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
