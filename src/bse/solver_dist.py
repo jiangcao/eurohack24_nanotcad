@@ -970,7 +970,7 @@ class BSESolverDist:
         local_nen = self.L0mat.stack_shape[0]
         P = xp.zeros((self.tipsize, self.tipsize, local_nen), dtype=xp.complex128)
         Gamma = xp.zeros(
-            (self.tipsize, self.tipsize, self.tipsize, local_nen),
+            (self.tipsize, self.blocksize * self.num_blocks, local_nen),
             dtype=xp.complex128,
         )
 
@@ -1071,11 +1071,12 @@ class BSESolverDist:
                         )
                         @ self.L0mat.stack[ie].blocks[k + 1, 0]
                     )
-                for row in range(self.tipsize):
-                    for col in range(self.tipsize):
-                        i = self.table[0, row]
-                        j = self.table[0, col]
-                        P[i, j, ie] = tmp[row, col]
+                # for row in range(self.tipsize):
+                #     for col in range(self.tipsize):
+                #         i = self.table[0, row]
+                #         j = self.table[0, col]
+                reorder = self.table[0, : self.tipsize]
+                P[reorder[:, None], reorder, ie] = tmp[:, :]
                 # extract Gamma from upper-arrow block of L = A^{-1} @ L0, and Gamma_ijk := L_iijk
                 # L_01 = A_00 @ L0_01 + A_01 @ L0_11
                 tmp2 = xp.zeros(
@@ -1105,17 +1106,24 @@ class BSESolverDist:
                             @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
                         )
 
-                for row in range(self.tipsize):
-                    i = self.table[0, row]
-                    for ib in range(self.num_blocks):
-                        for ic in range(self.blocksize):
-                            col = ib * self.blocksize + ic + self.tipsize
+                # i = self.table[0, :self.tipsize]
+                # j = self.table[0, self.tipsize:self.size]
+                # k = self.table[1, self.tipsize:self.size]
+                Gamma[:, :, ie] = tmp2.reshape(
+                    (tmp2.shape[0], tmp2.shape[1] * tmp2.shape[2])
+                )
 
-                            if col < self.size:
-                                j = self.table[0, col]
-                                k = self.table[1, col]
+                # for row in range(self.tipsize):
+                #     i = self.table[0, row]
+                #     for ib in range(self.num_blocks):
+                #         for ic in range(self.blocksize):
+                #             col = ib * self.blocksize + ic + self.tipsize
 
-                                Gamma[i, j, k, ie] = tmp2[row, ic, ib]
+                #             if col < self.size:
+                #                 j = self.table[0, col]
+                #                 k = self.table[1, col]
+
+                #             Gamma[self.table[0, :], j, k, ie] = tmp2[:, ic, ib]
         return P, Gamma
 
 

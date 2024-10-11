@@ -36,7 +36,7 @@ def get_data(size) -> np.ndarray:
 # Prepare data.
 ndiag = 4
 nm_dev = int(indata["nm_dev"])
-num_E = 100
+num_E = 10
 step_E = 2
 
 if comm.rank == 0:
@@ -126,27 +126,27 @@ if comm.rank == 0:
     print("compute correlations ...", flush=True)
 
 bse_dist._calc_noninteracting_twobody_new(g_greater, g_lesser, step_E=step_E)
-bse._calc_noninteracting_twobody(GG, GL, step_E=step_E)
+# bse._calc_noninteracting_twobody(GG, GL, step_E=step_E)
 
 if not np.allclose(bse_dist.L0mat.rows, bse.L0mat.rows):
     print("rows do not match!")
 if not np.allclose(bse_dist.L0mat.cols, bse.L0mat.cols):
     print("rows do not match!")
 
-print(
-    "rank=",
-    comm.rank,
-    "rel data norm error=",
-    (np.linalg.norm(bse_dist.L0mat.data) - np.linalg.norm(bse.L0mat.data))
-    / np.linalg.norm(bse_dist.L0mat.data),
-)
-print(
-    "rank=",
-    comm.rank,
-    "rel data elementwise error=",
-    np.linalg.norm(bse_dist.L0mat.data - bse.L0mat.data)
-    / np.linalg.norm(bse_dist.L0mat.data),
-)
+# print(
+#     "rank=",
+#     comm.rank,
+#     "rel data norm error=",
+#     (np.linalg.norm(bse_dist.L0mat.data) - np.linalg.norm(bse.L0mat.data))
+#     / np.linalg.norm(bse_dist.L0mat.data),
+# )
+# print(
+#     "rank=",
+#     comm.rank,
+#     "rel data elementwise error=",
+#     np.linalg.norm(bse_dist.L0mat.data - bse.L0mat.data)
+#     / np.linalg.norm(bse_dist.L0mat.data),
+# )
 
 # if comm.rank == comm.size - 1:
 #     print("save data ...", flush=True)
@@ -176,20 +176,20 @@ if comm.rank == 0:
     print(" compute time = ", finish_time - start_time)
     start_time = finish_time
 
-    print("dense solve ...", flush=True)
+    # print("dense solve ...", flush=True)
 
-P2, Gamma2 = bse_dist._densesolve_interacting_twobody(V, W)
+# P2, Gamma2 = bse_dist._densesolve_interacting_twobody(V, W)
 
-comm.barrier()
+# comm.barrier()
 
-if comm.rank == 0:
-    finish_time = time.time()
-    print(" compute time = ", finish_time - start_time)
-    start_time = finish_time
+# if comm.rank == 0:
+#     finish_time = time.time()
+#     print(" compute time = ", finish_time - start_time)
+#     start_time = finish_time
 
-print(
-    "rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2))
-), "abs error=", np.sum(np.abs(P2 - P))
+# print(
+#     "rank=", comm.rank, "rel error=", np.sum(np.abs(P2 - P)) / np.sum(np.abs(P2))
+# ), "abs error=", np.sum(np.abs(P2 - P))
 
 # filename = datasetname + "output"
 # np.savez(filename + "_rank" + str(comm.rank), P=get_host(P))
