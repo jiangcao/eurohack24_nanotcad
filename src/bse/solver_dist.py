@@ -223,7 +223,7 @@ class BSESolverDist:
         BLOCK_SIZES = [self.size] * 1
         GLOBAL_STACK_SHAPE = (num_E,)
         self.num_E = num_E
-        data = np.zeros(len(self.rows_dist), dtype=xp.complex128)
+        data = np.zeros(len(self.rows_dist), dtype=np.complex128)
         coords = (self.rows_dist, self.cols_dist)
         coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
         self.L0mat_dist = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)

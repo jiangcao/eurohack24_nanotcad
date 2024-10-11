@@ -4,6 +4,7 @@ from cupyx.scipy import sparse as cusparse
 from mpi4py.MPI import COMM_WORLD as comm
 from qttools.datastructures import DSBCOO
 from qttools.utils.gpu_utils import get_device, get_host, xp
+from qttools.utils.mpi_utils import get_section_sizes
 from serinv.algs import ddbtasinv
 
 
@@ -143,7 +144,13 @@ class BSESolver:
         BLOCK_SIZES = [self.tipsize] + [self.blocksize] * self.num_blocks
         GLOBAL_STACK_SHAPE = (num_E,)
         self.num_E = num_E
-        data = xp.zeros(len(self.rows), dtype=xp.complex128)
+        # Determine how the data is distributed across the ranks.
+        stack_section_sizes, total_stack_size = get_section_sizes(
+            GLOBAL_STACK_SHAPE[0], comm.size, strategy="balanced"
+        )
+        data = xp.zeros(
+            (stack_section_sizes[comm.rank], len(self.rows)), dtype=xp.complex128
+        )
         self.L0mat = DSBCOO(
             data=data,
             rows=get_device(self.rows),
