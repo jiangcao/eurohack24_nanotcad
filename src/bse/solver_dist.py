@@ -1,21 +1,143 @@
 import time
 
+import cupy as cp
 import numba as nb
 import numpy as np
+from cupyx.profiler import time_range
 from cupyx.scipy import sparse as cusparse
 from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.MPI import Request
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import get_device, get_host, xp, synchronize_current_stream
+from qttools.utils.gpu_utils import get_device, get_host, synchronize_current_stream, xp
 from qttools.utils.mpi_utils import check_gpu_aware_mpi
-from scipy import fft as spfft
-from cupyx.scipy.fftpack import fftn, ifftn
-
 from scipy import sparse
 from serinv.algs import ddbtasinv
-from cupyx.profiler import time_range
 
 GPU_AWARE = check_gpu_aware_mpi()
+
+
+_compute_permutation_kernel = cp.RawKernel(
+    r"""
+extern "C" __global__
+void compute_permutation(
+    const int* perm_rows,
+    const int* perm_cols,
+    const int* rows,
+    const int* cols,
+    int* permutation,
+    int size
+) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < size) {
+        for (int j = 0; j < size; ++j) {
+            int cond = (perm_rows[j] == rows[i]) && (perm_cols[j] == cols[i]);
+            permutation[i] = permutation[i] * (1 - cond) + j * cond;
+        }
+    }
+}
+""",
+    "compute_permutation",
+)
+
+
+@time_range()
+def _compute_permutation_raw(
+    perm_rows: cp.ndarray, perm_cols: cp.ndarray, rows: cp.ndarray, cols: cp.ndarray
+):
+    size = rows.size
+    permutation = cp.zeros_like(rows, dtype=cp.int32)
+    threads_per_block = 256
+    blocks_per_grid = (size + threads_per_block - 1) // threads_per_block
+    _compute_permutation_kernel(
+        (blocks_per_grid,),
+        (threads_per_block,),
+        (
+            perm_rows.astype(cp.int32),
+            perm_cols.astype(cp.int32),
+            rows.astype(cp.int32),
+            cols.astype(cp.int32),
+            permutation,
+            size,
+        ),
+    )
+    return permutation
+
+
+_get_mapping_kernel = cp.RawKernel(
+    r"""
+extern "C" __global__
+void get_mapping(
+    const int* row,
+    const int* col,
+    const int* L_rows,
+    const int* L_cols,
+    const int* L_nnz_section_offsets,
+    int* L_idx,
+    int row_size,
+    int col_size,
+    int my_rank,
+    int L_rows_size,
+    int num_offsets
+) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    int j = blockDim.y * blockIdx.y + threadIdx.y;
+    if (i < row_size && j < col_size) {
+        int ind = -1;
+        for (int k = 0; k < L_rows_size; ++k) {
+            int cond = (
+                (L_rows[k] == row[i * col_size + j])
+                && (L_cols[k] == col[i * col_size + j])
+            );
+            ind = ind * (1 - cond) + k * cond;
+        }
+        int data_rank = -1;
+        for (int k = 0; k < num_offsets; ++k) {
+            int cond = L_nnz_section_offsets[k] <= ind;
+            data_rank = data_rank * (1 - cond) + k * cond;
+        }
+        int cond = (my_rank == data_rank);
+        L_idx[i * col_size + j] = (ind - L_nnz_section_offsets[data_rank]) * cond + (cond - 1);
+    }
+}
+""",
+    "get_mapping",
+)
+
+
+@time_range()
+def _get_mapping_raw(
+    row: cp.ndarray,
+    col: cp.ndarray,
+    L_rows: cp.ndarray,
+    L_cols: cp.ndarray,
+    my_rank: int,
+    L_nnz_section_offsets: cp.ndarray,
+):
+    row_size, col_size = row.shape
+    L_idx = cp.full((row_size, col_size), -1, dtype=cp.int32)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (
+        (row_size + threads_per_block[0] - 1) // threads_per_block[0],
+        (col_size + threads_per_block[1] - 1) // threads_per_block[1],
+    )
+    _get_mapping_kernel(
+        blocks_per_grid,
+        threads_per_block,
+        (
+            row.astype(cp.int32),
+            col.astype(cp.int32),
+            L_rows.astype(cp.int32),
+            L_cols.astype(cp.int32),
+            L_nnz_section_offsets.astype(cp.int32),
+            L_idx,
+            row_size,
+            col_size,
+            my_rank,
+            L_rows.shape[0],
+            L_nnz_section_offsets.shape[0],
+        ),
+    )
+    return L_idx
 
 
 class BSESolverDist:
@@ -46,7 +168,7 @@ class BSESolverDist:
 
     @time_range()
     @nb.njit(parallel=True, fastmath=True)
-    def _compute_permutation(
+    def _compute_permutation_numba(
         perm_rows: np.ndarray, perm_cols: np.ndarray, rows: np.ndarray, cols: np.ndarray
     ):
         permutation = np.zeros_like(rows, dtype=np.int32)
@@ -57,8 +179,15 @@ class BSESolverDist:
         return permutation
 
     @time_range()
+    def _compute_permutation(
+        perm_rows: xp.ndarray, perm_cols: xp.ndarray, rows: xp.ndarray, cols: xp.ndarray
+    ):
+        mask = (perm_rows == rows[:, None]) & (perm_cols == cols[:, None])
+        return mask.nonzero()[1]
+
+    @time_range()
     @nb.njit(parallel=True, fastmath=True)
-    def _get_mapping(
+    def _get_mapping_numba(
         row: np.ndarray,
         col: np.ndarray,
         L_rows: np.ndarray,
@@ -237,7 +366,7 @@ class BSESolverDist:
         return
 
     @time_range()
-    def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int = 1):
+    def _calc_noninteracting_twobody_old(self, GG: DSBCOO, GL: DSBCOO, step_E: int = 1):
         start_time = time.time()
         if self.L0mat_dist.distribution_state == "stack":
             self.L0mat_dist.dtranspose()
@@ -365,8 +494,6 @@ class BSESolverDist:
             if not GPU_AWARE:
                 gl_sendbuf[j] = get_host(gl_sendbuf[j])
 
-            # if np.isnan(gl_sendbuf[j]).any():
-            #     raise ValueError(f"rank {comm.rank}: gl send buffer contains NaNs")
             comm.Isend(gl_sendbuf[j], dest=j, tag=1)
 
         Request.Waitall(reqs_gl)
@@ -403,242 +530,101 @@ class BSESolverDist:
 
         start_inz_g = int(GG.nnz_section_offsets[comm.rank])
         end_inz_g = int(GG.nnz_section_offsets[comm.rank + 1])
-        inz = np.arange(start_inz_g, end_inz_g)
-        # start_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
-        # end_inz_l = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
+        inz = xp.arange(start_inz_g, end_inz_g)
 
         row = self.inverse_table_dist[GG.rows[inz[:, None]], GG.cols[inz[:]]]
         col = self.inverse_table_dist[GG.cols[inz[:, None]], GG.rows[inz[:]]]
 
-        inds = BSESolverDist._get_mapping(
-            get_host(row),
-            get_host(col),
-            get_host(self.L0mat_dist.rows),
-            get_host(self.L0mat_dist.cols),
+        inds = _get_mapping_raw(
+            row,
+            col,
+            self.L0mat_dist.rows,
+            self.L0mat_dist.cols,
             comm.rank,
-            get_host(self.L0mat_dist.nnz_section_offsets),
+            self.L0mat_dist.nnz_section_offsets,
         )
-
-        inds = get_device(inds)
         valid = xp.where(inds != -1)
 
         self.L0mat_dist._data[
             xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
         ] = local_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
-        # with time_range("local elements", color_id=comm.rank):
-        #     for gg_inz in range(start_inz_g, end_inz_g):
-        #         i = GG.rows[gg_inz]
-        #         k = GG.cols[gg_inz]
-        #         for gl_inz in range(start_inz_g, end_inz_g):
-        #             l = GL.rows[gl_inz]
-        #             j = GL.cols[gl_inz]
-
-        #             row = self.inverse_table_dist[i, j]
-        #             col = self.inverse_table_dist[k, l]
-
-        #             if np.isnan(row) or np.isnan(col):
-        #                 continue
-        #             try:
-        #                 self.L0mat_dist[row, col] = local_elements[
-        #                     G_nen : G_nen + self.num_E * step_E : step_E,
-        #                     gg_inz - start_inz_g,
-        #                     gl_inz - start_inz_g,
-        #                 ]
-        #             except IndexError as e:
-        #                 print(e)
-        #                 continue
-
         if comm.size > 1:
             local_buf_elements = kron_correlate(GG.data, gl_recbuf) - kron_correlate(
                 GL.data, gg_recbuf
             )
 
-            row = self.inverse_table_dist[GG.rows[inz[:, None]], GG.cols[(get_nnz_idx[comm.rank])[:]]]
-            col = self.inverse_table_dist[GG.cols[inz[:, None]], GG.rows[(get_nnz_idx[comm.rank])[:]]]
+            row = self.inverse_table_dist[
+                GG.rows[inz[:, None]], GG.cols[(get_nnz_idx[comm.rank])[:]]
+            ]
+            col = self.inverse_table_dist[
+                GG.cols[inz[:, None]], GG.rows[(get_nnz_idx[comm.rank])[:]]
+            ]
 
-            inds = BSESolverDist._get_mapping(
-                get_host(row),
-                get_host(col),
-                get_host(self.L0mat_dist.rows),
-                get_host(self.L0mat_dist.cols),
+            inds = _get_mapping_raw(
+                row,
+                col,
+                self.L0mat_dist.rows,
+                self.L0mat_dist.cols,
                 comm.rank,
-                get_host(self.L0mat_dist.nnz_section_offsets),
+                self.L0mat_dist.nnz_section_offsets,
             )
-
-            inds = get_device(inds)
             valid = xp.where(inds != -1)
 
             self.L0mat_dist._data[
                 xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
             ] = local_buf_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
-            # with time_range("recv elements", color_id=comm.rank):
-            #     for gg_inz in range(start_inz_g, end_inz_g):
-            #         i = GG.rows[gg_inz]
-            #         k = GG.cols[gg_inz]
-            #         for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-            #             l = GL.rows[idx]
-            #             j = GL.cols[idx]
-
-            #             row = self.inverse_table_dist[i, j]
-            #             col = self.inverse_table_dist[k, l]
-
-            #             if np.isnan(row) or np.isnan(col):
-            #                 continue
-
-            #             try:
-            #                 self.L0mat_dist[row, col] = local_buf_elements[
-            #                     G_nen : G_nen + self.num_E * step_E : step_E,
-            #                     gg_inz - start_inz_g,
-            #                     iidx,
-            #                 ]
-            #             except IndexError as e:
-            #                 print(e)
-            #                 continue
-
-
             buf_local_elements = kron_correlate(gg_recbuf, GL.data) - kron_correlate(
                 gl_recbuf, GG.data
             )
 
-            row = self.inverse_table_dist[GG.rows[(get_nnz_idx[comm.rank])[:, None]], GG.cols[inz[:]]]
-            col = self.inverse_table_dist[GG.cols[(get_nnz_idx[comm.rank])[:, None]], GG.rows[inz[:]]]
+            row = self.inverse_table_dist[
+                GG.rows[(get_nnz_idx[comm.rank])[:, None]], GG.cols[inz[:]]
+            ]
+            col = self.inverse_table_dist[
+                GG.cols[(get_nnz_idx[comm.rank])[:, None]], GG.rows[inz[:]]
+            ]
 
-            inds = BSESolverDist._get_mapping(
-                get_host(row),
-                get_host(col),
-                get_host(self.L0mat_dist.rows),
-                get_host(self.L0mat_dist.cols),
+            inds = _get_mapping_raw(
+                row,
+                col,
+                self.L0mat_dist.rows,
+                self.L0mat_dist.cols,
                 comm.rank,
-                get_host(self.L0mat_dist.nnz_section_offsets),
+                self.L0mat_dist.nnz_section_offsets,
             )
-
-            inds = get_device(inds)
             valid = xp.where(inds != -1)
 
             self.L0mat_dist._data[
                 xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
             ] = buf_local_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
 
-            # with time_range("recv elements ", color_id=comm.rank):
-            #     for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-            #         i = GL.rows[idx]
-            #         k = GL.cols[idx]
-            #         for gg_inz in range(start_inz_g, end_inz_g):
-            #             l = GG.rows[gg_inz]
-            #             j = GG.cols[gg_inz]
-
-            #             row = self.inverse_table_dist[i, j]
-            #             col = self.inverse_table_dist[k, l]
-
-            #             if np.isnan(row) or np.isnan(col):
-            #                 continue
-
-            #             try:
-            #                 self.L0mat_dist[row, col] = buf_local_elements[
-            #                     G_nen : G_nen + self.num_E * step_E : step_E,
-            #                     iidx,
-            #                     gg_inz - start_inz_g,
-            #                 ]
-            #             except IndexError as e:
-            #                 print(e)
-            #                 continue
-
             buf_elements = kron_correlate(gg_recbuf, gl_recbuf) - kron_correlate(
                 gl_recbuf, gg_recbuf
             )
-            row = self.inverse_table_dist[GG.rows[(get_nnz_idx[comm.rank])[:, None]], GG.cols[(get_nnz_idx[comm.rank])[:]]]
-            col = self.inverse_table_dist[GG.cols[(get_nnz_idx[comm.rank])[:, None]], GG.rows[(get_nnz_idx[comm.rank])[:]]]
+            row = self.inverse_table_dist[
+                GG.rows[(get_nnz_idx[comm.rank])[:, None]],
+                GG.cols[(get_nnz_idx[comm.rank])[:]],
+            ]
+            col = self.inverse_table_dist[
+                GG.cols[(get_nnz_idx[comm.rank])[:, None]],
+                GG.rows[(get_nnz_idx[comm.rank])[:]],
+            ]
 
-            inds = BSESolverDist._get_mapping(
-                get_host(row),
-                get_host(col),
-                get_host(self.L0mat_dist.rows),
-                get_host(self.L0mat_dist.cols),
+            inds = _get_mapping_raw(
+                row,
+                col,
+                self.L0mat_dist.rows,
+                self.L0mat_dist.cols,
                 comm.rank,
-                get_host(self.L0mat_dist.nnz_section_offsets),
+                self.L0mat_dist.nnz_section_offsets,
             )
-
-            inds = get_device(inds)
             valid = xp.where(inds != -1)
 
             self.L0mat_dist._data[
                 xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
             ] = buf_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
-
-            # with time_range("recv elements ", color_id=comm.rank):
-            #     for iidx, idx in enumerate(get_nnz_idx[comm.rank]):
-            #         i = GL.rows[idx]
-            #         k = GL.cols[idx]
-            #         for i2idx, idx_v2 in enumerate(get_nnz_idx[comm.rank]):
-            #             l = GG.rows[idx_v2]
-            #             j = GG.cols[idx_v2]
-
-            #             row = self.inverse_table_dist[i, j]
-            #             col = self.inverse_table_dist[k, l]
-
-            #             if np.isnan(row) or np.isnan(col):
-            #                 continue
-
-            #             try:
-            #                 self.L0mat_dist[row, col] = buf_elements[
-            #                     G_nen : G_nen + self.num_E * step_E : step_E,
-            #                     iidx,
-            #                     i2idx,
-            #                 ]
-            #             except IndexError as e:
-            #                 print(e)
-            #                 continue
-
-        # start_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank])
-        # end_inz = int(self.L0mat_dist.nnz_section_offsets[comm.rank + 1])
-        # for inz in range(start_inz, end_inz):
-        #     with time_range("access elements", color_id=comm.rank):
-        #         row = self.L0mat_dist.rows[inz]
-        #         col = self.L0mat_dist.cols[inz]
-
-        #         i = self.table_dist[0, row]
-        #         j = self.table_dist[1, row]
-        #         k = self.table_dist[0, col]
-        #         l = self.table_dist[1, col]
-
-        #         ind_ik = xp.where((GG.rows == i) & (GG.cols == k))[0]
-
-        #         rank_ik = xp.where(GG.nnz_section_offsets <= ind_ik[0])[0][-1]
-        #         if comm.rank == rank_ik:
-        #             gg_ik = GG.data[..., ind_ik[0] - GG.nnz_section_offsets[rank_ik]]
-        #             gl_ik = GL.data[..., ind_ik[0] - GL.nnz_section_offsets[rank_ik]]
-        #         else:
-        #             ind = xp.where(get_nnz_idx[comm.rank] == ind_ik[0])[0]
-        #             # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-        #             # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-        #             # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
-        #             # print(f"rank {comm.rank}:", ind_ik, flush=True)
-        #             gg_ik = gg_recbuf[..., ind[0]]
-        #             gl_ik = gl_recbuf[..., ind[0]]
-
-        #         ind_lj = xp.where((GL.rows == l) & (GL.cols == j))[0]
-        #         # print(ind_lj)
-        #         # could happen that the G_{lj} is zero so not found in G
-        #         rank_lj = xp.where(GL.nnz_section_offsets <= ind_lj[0])[0][-1]
-        #         if comm.rank == rank_lj:
-        #             gg_lj = GG.data[..., ind_lj[0] - GG.nnz_section_offsets[rank_lj]]
-        #             gl_lj = GL.data[..., ind_lj[0] - GL.nnz_section_offsets[rank_lj]]
-        #         else:
-        #             ind = xp.where(get_nnz_idx[comm.rank] == ind_lj[0])[0]
-        #             # print(f"rank {comm.rank}:", ind, (i, j, k, l), flush=True)
-        #             # print(f"rank {comm.rank}:", get_nnz_idx[comm.rank], flush=True)
-        #             # print(f"rank {comm.rank}:", gg_recbuf[0], flush=True)
-        #             # print(f"rank {comm.rank}:", ind_lj, flush=True)
-        #             gg_lj = gg_recbuf[..., ind[0]]
-        #             gl_lj = gl_recbuf[..., ind[0]]
-
-        # with time_range("compute L0", color_id=comm.rank):
-        #     L_ijkl = correlate(gg_ik, gl_lj) - correlate(gl_ik, gg_lj)
-        #     self.L0mat_dist[row, col] = L_ijkl[
-        #         G_nen : G_nen + self.num_E * step_E : step_E
-        #     ]
 
         finish_time = time.time()
         print(
@@ -663,37 +649,14 @@ class BSESolverDist:
         if comm.rank == 0:
             print(" dtranspose time=", finish_time - start_time, flush=True)
         start_time = finish_time
-
-        # if comm.rank == 0:
-        #     np.save("L0_rows.npy", self.L0mat_dist.rows)
-        #     np.save("L0_cols.npy", self.L0mat_dist.cols)
-        #     np.save("L0_data.npy", self.L0mat_dist.data[0])
-
-        #     np.save("bta_rows.npy", self.rows)
-        #     np.save("bta_cols.npy", self.cols)
-
-        #     np.save("table.npy", self.table)
-        #     np.save("inverse_table.npy", self.inverse_table)
-        #     np.save("table_dist.npy", self.table_dist)
-        #     np.save("inverse_table_dist.npy", self.inverse_table_dist)
-
-        # return
-
-        # reorder L0mat to BTA shape
-        # !!! an additional L0mat gets allocated temporarily !!!
-
         BLOCK_SIZES = [self.tipsize] + [self.blocksize] * self.num_blocks
         GLOBAL_STACK_SHAPE = (self.num_E,)
-        # data = np.zeros(len(self.rows), dtype=xp.complex128)
-        # coords = (self.rows, self.cols)
-        # coo = sparse.coo_array((data, coords), shape=ARRAY_SHAPE)
-        # self.L0mat = DSBCOO.from_sparray(coo, BLOCK_SIZES, GLOBAL_STACK_SHAPE)
 
         perm_rows = self.inverse_table[*self.table_dist[:, self.L0mat_dist.rows]]
         perm_cols = self.inverse_table[*self.table_dist[:, self.L0mat_dist.cols]]
 
-        permutation = BSESolverDist._compute_permutation(
-            get_host(perm_rows), get_host(perm_cols), self.rows, self.cols
+        permutation = _compute_permutation_raw(
+            perm_rows, perm_cols, get_device(self.rows), get_device(self.cols)
         )
 
         finish_time = time.time()
@@ -727,6 +690,293 @@ class BSESolverDist:
         )
         start_time = finish_time
 
+        return
+
+    @time_range()
+    def _calc_noninteracting_twobody(self, GG: DSBCOO, GL: DSBCOO, step_E: int = 1):
+        start_time = time.time()
+
+        if self.L0mat_dist.distribution_state == "stack":
+            self.L0mat_dist.dtranspose()
+        if GG.distribution_state == "stack":
+            GG.dtranspose()
+        if GL.distribution_state == "stack":
+            GL.dtranspose()
+        finish_time = time.time()
+        if comm.rank == 0:
+            print(" dtranspose time=", finish_time - start_time, flush=True)
+        start_time = finish_time
+
+        G_nen = GG.data.shape[0]
+
+        get_nnz_size, get_nnz_idx, get_nnz_rank = BSESolverDist._determine_rank_map(
+            GG.nnz_section_offsets,
+            self.cutoff,
+            GG.rows,
+            GG.cols,
+        )
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "rank map compute time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
+        gg_recbuf = [None] * 2
+        gl_recbuf = [None] * 2
+        gg_sendbuf = [None] * 2
+        gl_sendbuf = [None] * 2
+
+        synchronize_current_stream()
+
+        offsets = [
+            i for i in range(-comm.size, comm.size) if i != 0
+        ]  # [-2, -1, 1, 2]  # list of overlapping neighboring ranks
+
+        for offset in offsets:
+            # receive from comm.rank - offset
+            i = comm.rank - offset
+            if (i > -1) and (i < comm.size):
+                mask_buffer = get_nnz_rank[comm.rank] == i
+                if mask_buffer.any():
+                    if not GPU_AWARE:
+                        gg_recbuf[0] = np.zeros(
+                            (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                        )
+                        gl_recbuf[0] = np.zeros(
+                            (G_nen, int(mask_buffer.sum())), dtype=np.complex128
+                        )
+                    else:
+                        gg_recbuf[0] = xp.zeros(
+                            (G_nen, int(mask_buffer.sum())), dtype=xp.complex128
+                        )
+                        gl_recbuf[0] = xp.zeros(
+                            (G_nen, int(mask_buffer.sum())), dtype=xp.complex128
+                        )
+                    print(f"Posting receive {i}-->{comm.rank}", flush=True)
+                    reqs_gg = comm.Irecv(gg_recbuf[0], source=i, tag=0)
+                    reqs_gl = comm.Irecv(gl_recbuf[0], source=i, tag=1)
+            # send to comm.rank + offset
+            j = comm.rank + offset
+            if (j < comm.size) and (j > -1):
+                inds_rank_to_j = get_nnz_idx[j][get_nnz_rank[j] == comm.rank]
+                if inds_rank_to_j.any():
+                    if not GPU_AWARE:
+                        gg_sendbuf[0] = np.zeros(
+                            (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                        )
+                        gl_sendbuf[0] = np.zeros(
+                            (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                        )
+                    else:
+                        gg_sendbuf[0] = xp.zeros(
+                            (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                        )
+                        gl_sendbuf[0] = xp.zeros(
+                            (G_nen, int(inds_rank_to_j.size)), dtype=np.complex128
+                        )
+                    print(f"Posting send {comm.rank}-->{j}", flush=True)
+                    gg_sendbuf[0] = GG.data[
+                        ..., inds_rank_to_j - GG.nnz_section_offsets[comm.rank]
+                    ]
+                    gl_sendbuf[0] = GL.data[
+                        ..., inds_rank_to_j - GG.nnz_section_offsets[comm.rank]
+                    ]
+                    if not GPU_AWARE:
+                        gg_sendbuf[0] = get_host(gg_sendbuf[0])
+                        gl_sendbuf[0] = get_host(gl_sendbuf[0])
+
+                    comm.Isend(gg_sendbuf[0], dest=j, tag=0)
+                    comm.Isend(gl_sendbuf[0], dest=j, tag=1)
+
+            # non-local part
+            if (i > -1) and (i < comm.size) and (mask_buffer.any()):
+                # wait for some data comes in
+                recbuf_idx = get_nnz_idx[comm.rank][get_nnz_rank[comm.rank] == i]
+                Request.Waitall([reqs_gg, reqs_gl])
+                dev_gl_recbuf = get_device(gl_recbuf[0])
+                dev_gg_recbuf = get_device(gg_recbuf[0])
+                synchronize_current_stream()
+                ### Done transfer, now do some computations
+                start_inz_g = int(GG.nnz_section_offsets[comm.rank])
+                end_inz_g = int(GG.nnz_section_offsets[comm.rank + 1])
+                inz = np.arange(start_inz_g, end_inz_g)
+                # correlation of local G data with recv buffer
+                local_buf_elements = kron_correlate(
+                    GG.data, dev_gl_recbuf
+                ) - kron_correlate(GL.data, dev_gg_recbuf)
+                row = self.inverse_table_dist[
+                    GG.rows[inz[:, None]], GG.cols[(recbuf_idx)[:]]
+                ]
+                col = self.inverse_table_dist[
+                    GG.cols[inz[:, None]], GG.rows[(recbuf_idx)[:]]
+                ]
+
+                inds = _get_mapping_raw(
+                    row,
+                    col,
+                    self.L0mat_dist.rows,
+                    self.L0mat_dist.cols,
+                    comm.rank,
+                    self.L0mat_dist.nnz_section_offsets,
+                )
+
+                valid = xp.where(inds != -1)
+                self.L0mat_dist._data[
+                    xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+                ] = local_buf_elements[
+                    G_nen : G_nen + self.num_E * step_E : step_E, *valid
+                ]
+
+                # recv buffer with local G data
+                buf_local_elements = kron_correlate(
+                    dev_gg_recbuf, GL.data
+                ) - kron_correlate(dev_gl_recbuf, GG.data)
+                row = self.inverse_table_dist[
+                    GG.rows[recbuf_idx[:, None]], GG.cols[inz[:]]
+                ]
+                col = self.inverse_table_dist[
+                    GG.cols[recbuf_idx[:, None]], GG.rows[inz[:]]
+                ]
+                inds = _get_mapping_raw(
+                    row,
+                    col,
+                    self.L0mat_dist.rows,
+                    self.L0mat_dist.cols,
+                    comm.rank,
+                    self.L0mat_dist.nnz_section_offsets,
+                )
+                valid = xp.where(inds != -1)
+                self.L0mat_dist._data[
+                    xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+                ] = buf_local_elements[
+                    G_nen : G_nen + self.num_E * step_E : step_E, *valid
+                ]
+                # recv buffer with recv buffer
+                buf_elements = kron_correlate(
+                    dev_gg_recbuf, dev_gl_recbuf
+                ) - kron_correlate(dev_gl_recbuf, dev_gg_recbuf)
+                row = self.inverse_table_dist[
+                    GG.rows[recbuf_idx[:, None]],
+                    GG.cols[recbuf_idx[:]],
+                ]
+                col = self.inverse_table_dist[
+                    GG.cols[recbuf_idx[:, None]],
+                    GG.rows[recbuf_idx[:]],
+                ]
+                inds = _get_mapping_raw(
+                    row,
+                    col,
+                    self.L0mat_dist.rows,
+                    self.L0mat_dist.cols,
+                    comm.rank,
+                    self.L0mat_dist.nnz_section_offsets,
+                )
+                valid = xp.where(inds != -1)
+                self.L0mat_dist._data[
+                    xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+                ] = buf_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "non-local elements compute time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
+        # compute L with local data on the current rank
+        start_inz_g = int(GG.nnz_section_offsets[comm.rank])
+        end_inz_g = int(GG.nnz_section_offsets[comm.rank + 1])
+        inz = np.arange(start_inz_g, end_inz_g)
+        jnz = np.arange(start_inz_g, end_inz_g)
+        # adjust this to match the GPU memory
+        step_inz = 10
+        for iinz in range(0, len(inz), step_inz):
+            local_inz = inz[iinz] - int(GG.nnz_section_offsets[comm.rank])
+            local_elements = kron_correlate(
+                GG.data[:, local_inz : local_inz + step_inz], GL.data
+            ) - kron_correlate(GL.data[:, local_inz : local_inz + step_inz], GG.data)
+            row = self.inverse_table_dist[
+                GG.rows[inz[local_inz : local_inz + step_inz, None]], GG.cols[jnz[:]]
+            ]
+            col = self.inverse_table_dist[
+                GG.cols[inz[local_inz : local_inz + step_inz, None]], GG.rows[jnz[:]]
+            ]
+            inds = _get_mapping_raw(
+                row,
+                col,
+                self.L0mat_dist.rows,
+                self.L0mat_dist.cols,
+                comm.rank,
+                self.L0mat_dist.nnz_section_offsets,
+            )
+            valid = xp.where(inds != -1)
+            self.L0mat_dist._data[
+                xp.ix_(self.L0mat_dist._stack_padding_mask, inds[valid])
+            ] = local_elements[G_nen : G_nen + self.num_E * step_E : step_E, *valid]
+
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "local elements compute time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+
+        # transpose to stack distribution
+        self.L0mat_dist.dtranspose()
+
+        finish_time = time.time()
+        if comm.rank == 0:
+            print(" dtranspose time=", finish_time - start_time, flush=True)
+        start_time = finish_time
+
+        # reorder L0mat to BTA shape
+        BLOCK_SIZES = [self.tipsize] + [self.blocksize] * self.num_blocks
+        GLOBAL_STACK_SHAPE = (self.num_E,)
+        # compute the permutation array to go from normal to BTA ordering
+        perm_rows = self.inverse_table[*self.table_dist[:, self.L0mat_dist.rows]]
+        perm_cols = self.inverse_table[*self.table_dist[:, self.L0mat_dist.cols]]
+        permutation = _compute_permutation_raw(
+            perm_rows, perm_cols, get_device(self.rows), get_device(self.cols)
+        )
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "compute permutation time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
+        self.L0mat = DSBCOO(
+            data=self.L0mat_dist.data[..., permutation],
+            rows=get_device(self.rows),
+            cols=get_device(self.cols),
+            block_sizes=BLOCK_SIZES,
+            global_stack_shape=GLOBAL_STACK_SHAPE,
+        )
+        del self.rows
+        del self.cols
+        del self.L0mat_dist
+        finish_time = time.time()
+        print(
+            " rank ",
+            comm.rank,
+            "reorder to BTA matrix time=",
+            finish_time - start_time,
+            flush=True,
+        )
+        start_time = finish_time
         return
 
     @time_range()
@@ -775,6 +1025,7 @@ class BSESolverDist:
                 print("rank=", comm.rank, "ie=", ie + 1, "/", local_nen, flush=True)
                 data = self.L0mat.data[ie]
                 coords = (self.L0mat.rows, self.L0mat.cols)
+
                 L0 = cusparse.coo_matrix(
                     (data, coords), shape=(self.size, self.size)
                 ).todense()
@@ -832,7 +1083,7 @@ class BSESolverDist:
         local_nen = self.L0mat.stack_shape[0]
         P = xp.zeros((self.tipsize, self.tipsize, local_nen), dtype=xp.complex128)
         Gamma = xp.zeros(
-            (self.tipsize, self.tipsize, self.tipsize, local_nen),
+            (self.tipsize, self.blocksize * self.num_blocks, local_nen),
             dtype=xp.complex128,
         )
 
@@ -933,11 +1184,12 @@ class BSESolverDist:
                         )
                         @ self.L0mat.stack[ie].blocks[k + 1, 0]
                     )
-                for row in range(self.tipsize):
-                    for col in range(self.tipsize):
-                        i = self.table[0, row]
-                        j = self.table[0, col]
-                        P[i, j, ie] = tmp[row, col]
+                # for row in range(self.tipsize):
+                #     for col in range(self.tipsize):
+                #         i = self.table[0, row]
+                #         j = self.table[0, col]
+                reorder = self.table[0, : self.tipsize]
+                P[reorder[:, None], reorder, ie] = tmp[:, :]
                 # extract Gamma from upper-arrow block of L = A^{-1} @ L0, and Gamma_ijk := L_iijk
                 # L_01 = A_00 @ L0_01 + A_01 @ L0_11
                 tmp2 = xp.zeros(
@@ -967,17 +1219,24 @@ class BSESolverDist:
                             @ self.L0mat.stack[ie].blocks[k + 2, k + 1]
                         )
 
-                for row in range(self.tipsize):
-                    i = self.table[0, row]
-                    for ib in range(self.num_blocks):
-                        for ic in range(self.blocksize):
-                            col = ib * self.blocksize + ic + self.tipsize
+                # i = self.table[0, :self.tipsize]
+                # j = self.table[0, self.tipsize:self.size]
+                # k = self.table[1, self.tipsize:self.size]
+                Gamma[:, :, ie] = tmp2.reshape(
+                    (tmp2.shape[0], tmp2.shape[1] * tmp2.shape[2])
+                )
 
-                            if col < self.size:
-                                j = self.table[0, col]
-                                k = self.table[1, col]
+                # for row in range(self.tipsize):
+                #     i = self.table[0, row]
+                #     for ib in range(self.num_blocks):
+                #         for ic in range(self.blocksize):
+                #             col = ib * self.blocksize + ic + self.tipsize
 
-                                Gamma[i, j, k, ie] = tmp2[row, ic, ib]
+                #             if col < self.size:
+                #                 j = self.table[0, col]
+                #                 k = self.table[1, col]
+
+                #             Gamma[self.table[0, :], j, k, ie] = tmp2[:, ic, ib]
         return P, Gamma
 
 

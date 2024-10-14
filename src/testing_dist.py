@@ -3,7 +3,7 @@ import time
 import numpy as np
 from mpi4py.MPI import COMM_WORLD as comm
 from qttools.datastructures import DSBCOO
-from qttools.utils.gpu_utils import xp, get_host
+from qttools.utils.gpu_utils import get_host, xp
 from scipy import sparse
 
 from bse import BSESolver, BSESolverDist
@@ -35,7 +35,7 @@ def get_data(size) -> np.ndarray:
 
 # Prepare data.
 ndiag = 4
-nm_dev = 50 # int(indata["nm_dev"])
+nm_dev = int(indata["nm_dev"])
 
 if comm.rank == 0:
     GL = np.array(
